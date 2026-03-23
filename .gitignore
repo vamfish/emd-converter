@@ -1,0 +1,50 @@
+# ==========================================
+# EMD Converter - Git 忽略文件
+# ==========================================
+
+# Python 缓存文件
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/__pycache__/
+
+# PyInstaller 打包相关（不需要上传构建产物）
+build/
+dist/EMD_Converter/
+*.spec
+*.manifest
+
+# 打包脚本（可选，如果只想保留源代码）
+build_exe.py
+build_simple.bat
+
+# 生成的压缩包
+*.zip
+*.7z
+*.tar.gz
+
+# 程序运行产生的文件
+gui_config.json
+emd_converted/
+*.log
+
+# IDE 和编辑器
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Windows 系统文件
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# 临时文件
+*.tmp
+temp/
+tmp/
