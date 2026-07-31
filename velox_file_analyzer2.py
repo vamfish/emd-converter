@@ -2029,6 +2029,16 @@ def get_unit_symbol(unit: str) -> str:
     获取单位符号
     """
     unit_symbols = {
+        # 倒数空间单位（衍射图，如 SAD），必须先于普通单位精确匹配，
+        # 否则会被下方的 endswith 回退错误匹配为 'm'/'nm' 等
+        '1/m': '1/m',
+        '1/cm': '1/cm',
+        '1/mm': '1/mm',
+        '1/µm': '1/µm',
+        '1/um': '1/µm',
+        '1/nm': '1/nm',
+        '1/å': '1/Å',
+        '1/angstrom': '1/Å',
         'm': 'm',
         'meter': 'm',
         'meters': 'm',
