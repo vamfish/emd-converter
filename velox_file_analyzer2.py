@@ -23,7 +23,6 @@ from PIL import Image
 from pathlib import Path
 from urllib.parse import unquote
 from tqdm import tqdm
-from scipy.interpolate import RectBivariateSpline
 from bs4 import BeautifulSoup
 from typing import Optional, Tuple, Dict, List, Any, Union
 
@@ -2722,47 +2721,53 @@ class VeloxFileAnalyzer:
     
     def _extract_profile_data(self, sample_positions, perpendicular_samples):
         """提取剖面数据。"""
-        def _spline(arr, x, y):
-            """双线性插值。"""
-            # 创建索引坐标
-            x_indices = np.arange(arr.shape[1])  # 列索引
-            y_indices = np.arange(arr.shape[0])  # 行索引
-            
-            # 创建双线性插值器
-            spline = RectBivariateSpline(x_indices, y_indices, arr.T, kx=1, ky=1)
-            result = spline(x, y)
-            
-            return float(result.squeeze())
-        
+        def _bilinear(arr, xs, ys):
+            """
+            向量化双线性插值。
+            与 RectBivariateSpline(kx=1, ky=1) 数学等价，但可批量计算，
+            避免对每个采样点重建整个数组的样条对象。
+            """
+            h, w = arr.shape
+            x0 = np.clip(np.floor(xs).astype(np.int64), 0, w - 2)
+            y0 = np.clip(np.floor(ys).astype(np.int64), 0, h - 2)
+            fx = (xs - x0).astype(arr.dtype, copy=False)
+            fy = (ys - y0).astype(arr.dtype, copy=False)
+            v00 = arr[y0, x0]
+            v10 = arr[y0, x0 + 1]
+            v01 = arr[y0 + 1, x0]
+            v11 = arr[y0 + 1, x0 + 1]
+            return (v00 * (1 - fx) * (1 - fy) +
+                    v10 * fx * (1 - fy) +
+                    v01 * (1 - fx) * fy +
+                    v11 * fx * fy)
+
         profile_data_with_width = {}
-        
+
         for key, comp in self.mapping_data.items():
             comp_id = key
-            frame_index = comp.get('frameIndex', 0)
+            frame_index = comp.get('frame_index', 0)
             image_data = comp['data'][:, :, frame_index]
-            
+
             if image_data is not None:
-                # 提取每个采样点的垂直剖面
-                profile_2d = []  # 2D数组：[沿中心线位置] × [垂直位置]
-                
+                # 提取每个采样点的垂直剖面 (批量双线性插值)
+                profile_2d = []
                 for perp_line in perpendicular_samples:
-                    line_values = []
-                    for x, y, w in perp_line:
-                        value = _spline(image_data, x, y)
-                        line_values.append(value)
+                    xs = np.array([p[0] for p in perp_line])
+                    ys = np.array([p[1] for p in perp_line])
+                    line_values = _bilinear(image_data, xs, ys).tolist()
                     profile_2d.append(line_values)
-                
+
                 # 计算平均剖面（沿垂直方向平均）
                 profile_avg = np.mean(profile_2d, axis=1) if profile_2d else np.array([])
-                
+
                 profile_data_with_width[comp_id] = {
                     'profile_2d': np.array(profile_2d),  # 2D剖面数据
                     'profile_avg': profile_avg,  # 平均剖面
                     'color': comp['color']
                 }
-                
+
                 print(f"✓ {comp_id}: 提取了 {len(profile_2d)}×{len(profile_2d[0]) if profile_2d else 0} 的 2D 剖面")
-        
+
         return profile_data_with_width
     
     # ========================================================================
