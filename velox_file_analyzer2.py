@@ -23,7 +23,6 @@ from PIL import Image
 from pathlib import Path
 from urllib.parse import unquote
 from tqdm import tqdm
-from scipy.interpolate import RectBivariateSpline
 from bs4 import BeautifulSoup
 from typing import Optional, Tuple, Dict, List, Any, Union
 
@@ -2822,12 +2821,12 @@ class VeloxFileAnalyzer:
         ys = perp_arr[..., 1]
         
         profile_data_with_width = {}
-        
+
         for key, comp in self.mapping_data.items():
             comp_id = key
-            frame_index = comp.get('frameIndex', 0)
+            frame_index = comp.get('frame_index', 0)
             image_data = comp['data'][:, :, frame_index]
-            
+
             if image_data is not None:
                 # 向量化双线性插值: profile_2d 形状 (M, P)
                 profile_2d = _vectorized_bilinear_interp(image_data, xs, ys)
