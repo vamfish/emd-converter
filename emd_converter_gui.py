@@ -56,6 +56,338 @@ def add_suffix_safe(output_path: Path, suffix: str) -> Path:
     return output_path.parent / (name + suffix)
 
 
+# ============================================================================
+# 导出逻辑（独立于 GUI，顺序/并行执行共用同一实现，避免逻辑分叉）
+# ============================================================================
+
+def default_export_options() -> dict:
+    """导出选项结构。"""
+    return {
+        'dm5': True, 'tiff': True, 'png': True, 'csv': False,
+        'eds': {'export_colormix': True, 'export_elements': True,
+                'export_haadf': True},
+        'colormix': {'all_elements': True, 'with_annotation': True},
+    }
+
+
+def _export_eds_mapping_standalone(analyzer, output_dir, filename_stem, options, log=print):
+    """导出 EDS Mapping 数据（DM5/TIFF/PNG/CSV）。"""
+    from velox_file_analyzer2 import (
+        dm5_writer, save_as_16bit_tiff, save_image_as_png,
+        LinearSegmentedColormap, html_table_to_csv, save_color_mix_image,
+    )
+    quantification_mode = analyzer.parameters.get('quantification_mode', 'Unknown')
+    
+    # 导出定量结果
+    if options['csv']:
+        try:
+            output_path = output_dir / f"{filename_stem}-Quantification-{quantification_mode}.csv"
+            html_table_to_csv(analyzer.experiment_log, output_path=str(output_path))
+            log(f"  ✓ 定量结果: {output_path.name}")
+        except Exception as e:
+            log(f"  ✗ 导出定量结果失败: {e}")
+    
+    # 导出 Color Mix
+    if options['eds']['export_colormix'] and hasattr(analyzer, 'color_mix_image'):
+        try:
+            output_path = output_dir / f"{filename_stem}-Colormix.png"
+            save_color_mix_image(
+                image=analyzer.color_mix_image,
+                output_path=output_path,
+                pixel_size=analyzer.parameters['pixelsize'],
+                pixel_unit=analyzer.parameters['pixelunit']
+            )
+            log(f"  ✓ Color Mix: {output_path.name}")
+        except Exception as e:
+            log(f"  ✗ 导出 Color Mix 失败: {e}")
+    
+    # 导出各元素分布图和 HAADF
+    if options['eds']['export_elements'] or options['eds']['export_haadf']:
+        for key, value in analyzer.mapping_data.items():
+            is_haadf = 'HAADF' in key or 'BF' in key or 'DF' in key
+            if is_haadf and not options['eds']['export_haadf']:
+                continue
+            if not is_haadf and not options['eds']['export_elements']:
+                continue
+            
+            filename = f"{filename_stem}-{key}-{quantification_mode}"
+            data = value['data'][:, :, value['frame_index']]
+            output_path = output_dir / filename
+            
+            try:
+                if options['dm5']:
+                    dm5_writer(add_suffix_safe(output_path, '.dm5'), value, analyzer.parameters)
+                    log(f"  ✓ DM5: {filename}.dm5")
+                if options['tiff']:
+                    pixelunit = analyzer.parameters.get('pixelunit', 'nm')
+                    pixelsize = analyzer.parameters.get('pixelsize', 1.0)
+                    imagej_metadata = {
+                        'ImageJ': '1.54g',
+                        'unit': str(pixelunit).replace('μ', 'u'),
+                        'spacing': float(pixelsize)
+                    }
+                    if data.ndim == 3:
+                        imagej_metadata['slices'] = data.shape[-1]
+                    save_as_16bit_tiff(data, output_path, metadata=imagej_metadata)
+                    log(f"  ✓ TIFF: {filename}.tif")
+                if options['png']:
+                    color_rgb = (value['color']['red'], value['color']['green'], value['color']['blue'])
+                    cmap = LinearSegmentedColormap.from_list(
+                        'custom_cmap', colors=[(0, 0, 0), color_rgb], N=256
+                    )
+                    save_image_as_png(
+                        image=data,
+                        output_path=add_suffix_safe(output_path, '.png'),
+                        pixel_size=analyzer.parameters['pixelsize'],
+                        pixel_unit=analyzer.parameters['pixelunit'],
+                        cmap=cmap,
+                        display_range=value['display_range'],
+                        gamma=value['gamma'],
+                        display_index=value['frame_index'],
+                        add_scalebar=True
+                    )
+                    log(f"  ✓ PNG: {filename}.png")
+            except Exception as e:
+                log(f"  ✗ 导出 {key} 失败: {e}")
+
+
+def _export_spectra_standalone(analyzer, output_dir, filename_stem, options, log=print):
+    """导出 EDS 积分谱图 CSV。"""
+    from velox_file_analyzer2 import export_eds_spectrum
+    try:
+        filename = f"{filename_stem}-Spectra.csv"
+        output_path = output_dir / filename
+        export_eds_spectrum(
+            output_path=output_path,
+            intensity=analyzer.spectra_data['total'],
+            offset=analyzer.parameters.get('OffsetEnergy', -250),
+            channels=4096,
+            dispension=5
+        )
+        log(f"  ✓ 谱图 CSV: {filename}")
+    except Exception as e:
+        log(f"  ✗ 导出谱图失败: {e}")
+
+
+def _export_colormix_lineprofile_standalone(analyzer, output_dir, filename_stem, options, log=print):
+    """导出 Color Mix 与 Line Profile（PNG/CSV）。"""
+    from velox_file_analyzer2 import (
+        save_color_mix_image, draw_line_profiles, export_line_profile_as_csv,
+    )
+    quantification_mode = analyzer.parameters.get('quantification_mode', 'Unknown')
+    
+    if options['eds']['export_colormix'] and hasattr(analyzer, 'color_mix_image'):
+        try:
+            filename = f"{filename_stem}-Colormix-LineAnnotation.png"
+            output_path = output_dir / filename
+            line_info = analyzer.line_position if hasattr(analyzer, 'line_position') else None
+            if options['colormix']['with_annotation'] and line_info:
+                save_color_mix_image(
+                    analyzer.color_mix_image, output_path=output_path,
+                    line_info=line_info,
+                    pixel_size=analyzer.parameters['pixelsize'],
+                    pixel_unit=analyzer.parameters['pixelunit']
+                )
+            else:
+                save_color_mix_image(
+                    analyzer.color_mix_image, output_path=output_path,
+                    pixel_size=analyzer.parameters['pixelsize'],
+                    pixel_unit=analyzer.parameters['pixelunit']
+                )
+            log(f"  ✓ Color Mix (带标注): {filename}")
+        except Exception as e:
+            log(f"  ✗ 导出 Color Mix 失败: {e}")
+    
+    if options['png'] and hasattr(analyzer, 'line_profile_data'):
+        try:
+            filename = f"{filename_stem}-LineProfile.png"
+            output_path = output_dir / filename
+            draw_line_profiles(
+                analyzer.line_profile_data, output_path=output_path,
+                pixel_size=analyzer.parameters['pixelsize'],
+                pixel_unit=analyzer.parameters['pixelunit'],
+                line_length_px=analyzer.line_position.get('length') if hasattr(analyzer, 'line_position') else None
+            )
+            log(f"  ✓ Line Profile 图像: {filename}")
+        except Exception as e:
+            log(f"  ✗ 导出 Line Profile 图像失败: {e}")
+    
+    if options['csv'] and hasattr(analyzer, 'line_profile_data'):
+        try:
+            filename = f"{filename_stem}-LineProfile.csv"
+            output_path = output_dir / filename
+            export_line_profile_as_csv(
+                output_path,
+                line_length_pixel=analyzer.line_position.get('length') if hasattr(analyzer, 'line_position') else None,
+                line_profile=analyzer.line_profile_data,
+                pixelsize=analyzer.parameters['pixelsize'],
+                pixelunit=analyzer.parameters['pixelunit'],
+                quantification_mode=quantification_mode
+            )
+            log(f"  ✓ Line Profile CSV: {filename}")
+        except Exception as e:
+            log(f"  ✗ 导出 Line Profile CSV 失败: {e}")
+
+
+def _export_generic_image_standalone(analyzer, output_dir, filename_stem, param_key, data,
+                                     metadata, options, log=print, suffix=None, custom_name=None,
+                                     params_override=None):
+    """通用图像导出（DM5/TIFF/PNG）。"""
+    from velox_file_analyzer2 import dm5_writer, save_as_16bit_tiff, save_image_as_png
+    
+    params = analyzer.parameters.get(param_key, {})
+    if not isinstance(params, dict):
+        params = {}
+    if params_override:
+        params = params_override
+    
+    if custom_name:
+        filename = custom_name
+    elif suffix:
+        filename = f"{filename_stem}-{suffix}"
+    else:
+        filename = filename_stem
+    output_path = output_dir / filename
+    
+    try:
+        signal = {
+            'data': data,
+            'metadata': metadata,
+            'color': {'blue': 1, 'green': 1, 'red': 1},
+            'display_range': params.get('display_range', [0, 1]),
+            'gamma': params.get('gamma', 1.0)
+        }
+        
+        if options['dm5']:
+            dm5_data = data
+            if dm5_data.ndim == 2:
+                dm5_data = dm5_data[..., np.newaxis]
+            signal['data'] = dm5_data
+            dm5_writer(add_suffix_safe(output_path, '.dm5'), signal,
+                       params if params else analyzer.parameters)
+            log(f"  ✓ DM5: {filename}.dm5")
+        
+        if options['tiff']:
+            imagej_metadata = {
+                'ImageJ': '1.54g',
+                'unit': params.get('pixelunit', 'nm').replace('μ', 'u') if params else 'nm',
+                'spacing': params.get('pixelsize', 1.0) if params else 1.0
+            }
+            if data.ndim == 3:
+                imagej_metadata['slices'] = data.shape[-1]
+            save_as_16bit_tiff(data, output_path, metadata=imagej_metadata)
+            log(f"  ✓ TIFF: {filename}.tif")
+        
+        if options['png']:
+            if data.ndim == 2:
+                save_image_as_png(
+                    image=data,
+                    output_path=add_suffix_safe(output_path, '.png'),
+                    pixel_size=params.get('pixelsize', 1.0) if params else 1.0,
+                    pixel_unit=params.get('pixelunit', 'nm') if params else 'nm',
+                    display_range=params.get('display_range'),
+                    gamma=params.get('gamma', 1.0),
+                    add_scalebar=True
+                )
+            elif data.ndim == 3:
+                save_image_as_png(
+                    image=data,
+                    output_path=add_suffix_safe(output_path, '.png'),
+                    pixel_size=params.get('pixelsize', 1.0) if params else 1.0,
+                    pixel_unit=params.get('pixelunit', 'nm') if params else 'nm',
+                    display_range=params.get('display_range'),
+                    gamma=params.get('gamma', 1.0),
+                    display_index=params.get('display_index', 0),
+                    add_scalebar=True
+                )
+            log(f"  ✓ PNG: {filename}.png")
+    except Exception as e:
+        log(f"  ✗ 导出 {filename} 失败: {e}")
+
+
+def export_by_type_standalone(analyzer, output_dir, filename_stem, options, log=print):
+    """根据文件类型执行导出（与 GUI 顺序路径共用）。"""
+    from urllib.parse import unquote
+    
+    if hasattr(analyzer, 'si_feature_path'):
+        log("检测到 EDS Mapping 数据")
+        _export_eds_mapping_standalone(analyzer, output_dir, filename_stem, options, log)
+    if hasattr(analyzer, 'integrated_spectra_feature_path'):
+        log("检测到 EDS 积分谱图")
+        if options['csv']:
+            _export_spectra_standalone(analyzer, output_dir, filename_stem, options, log)
+    if hasattr(analyzer, 'color_mix_profile_feature_path'):
+        log("检测到 Color Mix + Line Profile")
+        _export_colormix_lineprofile_standalone(analyzer, output_dir, filename_stem, options, log)
+    if hasattr(analyzer, 'camera_feature_path'):
+        log("检测到 TEM 图像")
+        _export_generic_image_standalone(
+            analyzer, output_dir, filename_stem, 'Ceta',
+            analyzer.tem_data, analyzer.tem_metadata, options, log)
+    if hasattr(analyzer, 'stem_feature_path'):
+        log("检测到 STEM 图像")
+        for key in analyzer.stem_data.keys():
+            _export_generic_image_standalone(
+                analyzer, output_dir, filename_stem, key,
+                analyzer.stem_data[key], analyzer.stem_metadata.get(key, {}),
+                options, log, suffix=key)
+    if hasattr(analyzer, 'dpc_feature_path'):
+        log("检测到 DPC 图像")
+        for key in analyzer.dpc_data.keys():
+            _export_generic_image_standalone(
+                analyzer, output_dir, filename_stem, key,
+                analyzer.dpc_data[key], analyzer.dpc_metadata.get(key, {}),
+                options, log, suffix=key)
+    if hasattr(analyzer, 'dcfi_feature_path'):
+        log("检测到 DCFI 图像")
+        params = analyzer.parameters.get('DCFI', {})
+        image_name = params.get('image_name', f"{filename_stem}-DCFI")
+        _export_generic_image_standalone(
+            analyzer, output_dir, filename_stem, 'DCFI',
+            analyzer.dcfi_data, {}, options, log, custom_name=image_name)
+    if hasattr(analyzer, 'crop_feature_path'):
+        log("检测到裁剪图像")
+        params = analyzer.parameters.get('crop', {})
+        image_name = params.get('image_name', f"{filename_stem}-Crop")
+        _export_generic_image_standalone(
+            analyzer, output_dir, filename_stem, 'crop',
+            analyzer.crop_data, analyzer.crop_metadata, options, log,
+            custom_name=image_name)
+    if hasattr(analyzer, 'image_filter_feature_path'):
+        log("检测到滤波图像")
+        params = analyzer.parameters.get('filter', {})
+        image_name = params.get('image_name', f"{filename_stem}-Filtered")
+        _export_generic_image_standalone(
+            analyzer, output_dir, filename_stem, 'filter',
+            analyzer.filter_data, analyzer.filter_metadata, options, log,
+            custom_name=image_name)
+
+
+def process_one_file(args):
+    """子进程/线程 worker：解析并导出单个 EMD 文件。
+    
+    args = (file_path, output_base, options)。返回 (stem, error_or_None)。
+    """
+    file_path, output_base, options = args
+    stem = Path(file_path).stem
+    try:
+        analyzer = VeloxFileAnalyzer(file_path)
+        try:
+            file_output_dir = Path(output_base) / stem
+            file_output_dir.mkdir(parents=True, exist_ok=True)
+            export_by_type_standalone(analyzer, file_output_dir, stem, options, log=print)
+        finally:
+            try:
+                analyzer.f.close()
+            except Exception:
+                pass
+        return (stem, None)
+    except MemoryError:
+        return (stem, "内存不足，建议仅导出 DM5 并关闭其他程序")
+    except Exception as e:
+        return (stem, f"{type(e).__name__}: {e}")
+
+
 class EMDConverterGUI:
     """EMD 转换器图形界面"""
     
@@ -77,6 +409,9 @@ class EMDConverterGUI:
             'png': BooleanVar(value=True),
             'csv': BooleanVar(value=False),
         }
+        
+        # 并行处理选项（默认关闭；多核加速时按可用内存自动调度 worker 数）
+        self.parallel_var = BooleanVar(value=False)
         
         # EDS Mapping 特有选项
         self.eds_options = {
@@ -140,6 +475,7 @@ class EMDConverterGUI:
         self.cb_tiff = Checkbutton(self.format_frame, text="16-bit TIFF", variable=self.export_options['tiff'])
         self.cb_png = Checkbutton(self.format_frame, text="PNG 图像(带比例尺)", variable=self.export_options['png'])
         self.cb_csv = Checkbutton(self.format_frame, text="CSV 数据", variable=self.export_options['csv'])
+        self.cb_parallel = Checkbutton(self.format_frame, text="并行处理", variable=self.parallel_var)
         
         # EDS Mapping 选项
         self.eds_frame = Frame(self.options_frame)
@@ -208,6 +544,7 @@ class EMDConverterGUI:
         self.cb_tiff.pack(side='left', padx=10)
         self.cb_png.pack(side='left', padx=10)
         self.cb_csv.pack(side='left', padx=10)
+        self.cb_parallel.pack(side='left', padx=10)
         
         # EDS 选项
         self.eds_frame.pack(fill='x', padx=10, pady=2)
@@ -508,6 +845,12 @@ EMD 文件批量转换工具 v1.0
         """处理所有文件"""
         total = len(self.file_list)
         output_base = Path(self.output_dir.get())
+        options = self._current_export_options()
+        
+        if self.parallel_var.get() and len(self.file_list) > 1:
+            self._process_files_parallel(output_base, options)
+            return
+        
         success_count = 0
         failed = []  # (文件名, 错误信息)
         
@@ -553,6 +896,68 @@ EMD 文件批量转换工具 v1.0
                         pass
                 
         self.root.after(0, lambda: self._conversion_finished(success_count, failed))
+
+    def _process_files_parallel(self, output_base, options):
+        """通过进程池并行处理多个文件（worker 数按可用内存自适应）。"""
+        import traceback
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        
+        files = list(self.file_list)
+        total = len(files)
+        self._log(f"并行处理开启，任务数: {total}")
+        workers = self._compute_parallel_workers(files)
+        self._log(f"按可用内存自适应 worker 数: {workers}")
+        
+        tasks = [(str(fp), str(output_base), options) for fp in files]
+        success_count = 0
+        failed = []
+        done_count = 0
+        
+        try:
+            with ProcessPoolExecutor(max_workers=workers) as pool:
+                futures = {pool.submit(process_one_file, t): i for i, t in enumerate(tasks)}
+                for fut in as_completed(futures):
+                    if not self.is_processing:
+                        # 停止：取消尚未开始的未来任务（进行中的无法中断）
+                        for f2 in futures:
+                            f2.cancel()
+                        break
+                    done_count += 1
+                    idx = futures[fut]
+                    self.root.after(0, lambda i=idx + 1: self._update_progress(i, total, f"正在处理: {Path(files[idx]).name}"))
+                    try:
+                        stem, err = fut.result()
+                    except Exception as e:
+                        stem, err = Path(files[idx]).stem, f"worker 异常: {e}"
+                    if err:
+                        self._log(f"错误: {stem}: {err}")
+                        failed.append((stem, err))
+                    else:
+                        success_count += 1
+        except Exception as e:
+            self._log(traceback.format_exc())
+            failed.append(("并行执行", str(e)))
+        
+        self.root.after(0, lambda: self._conversion_finished(success_count, failed))
+    
+    @staticmethod
+    def _compute_parallel_workers(files) -> int:
+        """按可用内存 ÷ 单文件预估峰值计算 worker 数（上限 8）；
+        大文件自动独占（worker=1），避免多 worker 内存叠加。
+        """
+        try:
+            import psutil
+            avail = psutil.virtual_memory().available
+        except ImportError:
+            avail = 8 * 2**30  # 保守假设 8GB 可用
+        sizes = [max(p.stat().st_size, 1) for p in files]
+        biggest = max(sizes)
+        per_worker = max(biggest * 2.2, 512 * 2**20)  # 每个 worker 峰值 ≈ 最大文件 ×2.2
+        n = max(1, int(avail // per_worker))
+        # 若最重的单个文件本身即可占满预算，自动降为串行
+        if biggest * 2.2 > avail:
+            n = 1
+        return min(n, 8, len(files))
         
     def _update_progress(self, current, total, message):
         """更新进度"""
@@ -578,370 +983,35 @@ EMD 文件批量转换工具 v1.0
         messagebox.showinfo("完成", f"EMD 文件转换完成！\n成功: {success_count}\n失败: {len(failed)}")
         
     def _export_by_type(self, analyzer, output_dir):
-        """根据文件类型执行导出"""
+        """根据文件类型执行导出（委托给独立函数，与并行 worker 共用同一实现）。"""
         filename_stem = Path(analyzer.file_path).stem
-        
-        # 获取导出选项
-        export_dm5 = self.export_options['dm5'].get()
-        export_tiff = self.export_options['tiff'].get()
-        export_png = self.export_options['png'].get()
-        export_csv = self.export_options['csv'].get()
-        
-        # EDS Mapping 类型
-        if hasattr(analyzer, 'si_feature_path'):
-            self._log("检测到 EDS Mapping 数据")
-            self._export_eds_mapping(analyzer, output_dir, filename_stem)
-            
-        # 积分谱图类型
-        if hasattr(analyzer, 'integrated_spectra_feature_path'):
-            self._log("检测到 EDS 积分谱图")
-            if export_csv:
-                self._export_spectra(analyzer, output_dir, filename_stem)
-                
-        # Color Mix + Line Profile
-        if hasattr(analyzer, 'color_mix_profile_feature_path'):
-            self._log("检测到 Color Mix + Line Profile")
-            self._export_colormix_lineprofile(analyzer, output_dir, filename_stem)
-            
-        # TEM 图像
-        if hasattr(analyzer, 'camera_feature_path'):
-            self._log("检测到 TEM 图像")
-            self._export_tem(analyzer, output_dir, filename_stem)
-            
-        # STEM 图像
-        if hasattr(analyzer, 'stem_feature_path'):
-            self._log("检测到 STEM 图像")
-            self._export_stem(analyzer, output_dir, filename_stem)
-            
-        # DPC 图像
-        if hasattr(analyzer, 'dpc_feature_path'):
-            self._log("检测到 DPC 图像")
-            self._export_dpc(analyzer, output_dir, filename_stem)
-            
-        # DCFI 图像
-        if hasattr(analyzer, 'dcfi_feature_path'):
-            self._log("检测到 DCFI 图像")
-            self._export_dcfi(analyzer, output_dir, filename_stem)
-            
-        # 裁剪图像
-        if hasattr(analyzer, 'crop_feature_path'):
-            self._log("检测到裁剪图像")
-            self._export_crop(analyzer, output_dir, filename_stem)
+        options = self._current_export_options()
+        export_by_type_standalone(analyzer, output_dir, filename_stem, options,
+                                  log=self._log)
+    
+    def _current_export_options(self):
+        """从 GUI 控件状态构建导出选项字典（顺序/并行共用）。"""
+        return {
+            'dm5': self.export_options['dm5'].get(),
+            'tiff': self.export_options['tiff'].get(),
+            'png': self.export_options['png'].get(),
+            'csv': self.export_options['csv'].get(),
+            'eds': {
+                'export_colormix': self.eds_options['export_colormix'].get(),
+                'export_elements': self.eds_options['export_elements'].get(),
+                'export_haadf': self.eds_options['export_haadf'].get(),
+            },
+            'colormix': {
+                'all_elements': self.colormix_options['all_elements'].get(),
+                'with_annotation': self.colormix_options['with_annotation'].get(),
+            },
+        }
             
         # 滤波图像
         if hasattr(analyzer, 'image_filter_feature_path'):
             self._log("检测到滤波图像")
             self._export_filtered(analyzer, output_dir, filename_stem)
             
-    def _export_eds_mapping(self, analyzer, output_dir, filename_stem):
-        """导出 EDS Mapping 数据"""
-        from velox_file_analyzer2 import (
-            dm5_writer, save_as_16bit_tiff, save_image_as_png,
-            LinearSegmentedColormap
-        )
-        
-        quantification_mode = analyzer.parameters.get('quantification_mode', 'Unknown')
-        
-        # 导出定量结果
-        if self.export_options['csv'].get():
-            try:
-                from velox_file_analyzer2 import html_table_to_csv
-                output_path = output_dir / f"{filename_stem}-Quantification-{quantification_mode}.csv"
-                html_table_to_csv(analyzer.experiment_log, output_path=str(output_path))
-                self._log(f"  ✓ 定量结果: {output_path.name}")
-            except Exception as e:
-                self._log(f"  ✗ 导出定量结果失败: {e}")
-                
-        # 导出 Color Mix
-        if self.eds_options['export_colormix'].get() and hasattr(analyzer, 'color_mix_image'):
-            from velox_file_analyzer2 import save_color_mix_image
-            try:
-                output_path = output_dir / f"{filename_stem}-Colormix.png"
-                save_color_mix_image(
-                    image=analyzer.color_mix_image,
-                    output_path=output_path,
-                    pixel_size=analyzer.parameters['pixelsize'],
-                    pixel_unit=analyzer.parameters['pixelunit']
-                )
-                self._log(f"  ✓ Color Mix: {output_path.name}")
-            except Exception as e:
-                self._log(f"  ✗ 导出 Color Mix 失败: {e}")
-                
-        # 导出各元素分布图和 HAADF
-        if self.eds_options['export_elements'].get() or self.eds_options['export_haadf'].get():
-            for key, value in analyzer.mapping_data.items():
-                # 判断是否 HAADF
-                is_haadf = 'HAADF' in key or 'BF' in key or 'DF' in key
-                
-                if is_haadf and not self.eds_options['export_haadf'].get():
-                    continue
-                if not is_haadf and not self.eds_options['export_elements'].get():
-                    continue
-                    
-                filename = f"{filename_stem}-{key}-{quantification_mode}"
-                data = value['data'][:, :, value['frame_index']]
-                output_path = output_dir / filename
-                
-                try:
-                    # DM5
-                    if self.export_options['dm5'].get():
-                        dm5_writer(add_suffix_safe(output_path, '.dm5'), value, analyzer.parameters)
-                        self._log(f"  ✓ DM5: {filename}.dm5")
-                        
-                    # TIFF
-                    if self.export_options['tiff'].get():
-                        pixelunit = analyzer.parameters.get('pixelunit', 'nm')
-                        pixelsize = analyzer.parameters.get('pixelsize', 1.0)
-                        imagej_metadata = {
-                            'ImageJ': '1.54g',
-                            'unit': str(pixelunit).replace('μ', 'u'),
-                            'spacing': float(pixelsize)
-                        }
-                        if data.ndim == 3:
-                            imagej_metadata['slices'] = data.shape[-1]
-                        save_as_16bit_tiff(data, output_path, metadata=imagej_metadata)
-                        self._log(f"  ✓ TIFF: {filename}.tif")
-                        
-                    # PNG
-                    if self.export_options['png'].get():
-                        color_rgb = (value['color']['red'], value['color']['green'], value['color']['blue'])
-                        cmap = LinearSegmentedColormap.from_list(
-                            'custom_cmap',
-                            colors=[(0, 0, 0), color_rgb],
-                            N=256
-                        )
-                        save_image_as_png(
-                            image=data,
-                            output_path=add_suffix_safe(output_path, '.png'),
-                            pixel_size=analyzer.parameters['pixelsize'],
-                            pixel_unit=analyzer.parameters['pixelunit'],
-                            cmap=cmap,
-                            display_range=value['display_range'],
-                            gamma=value['gamma'],
-                            display_index=value['frame_index'],
-                            add_scalebar=True
-                        )
-                        self._log(f"  ✓ PNG: {filename}.png")
-                        
-                except Exception as e:
-                    self._log(f"  ✗ 导出 {key} 失败: {e}")
-                    
-    def _export_spectra(self, analyzer, output_dir, filename_stem):
-        """导出 EDS 谱图"""
-        from velox_file_analyzer2 import export_eds_spectrum
-        try:
-            filename = f"{filename_stem}-Spectra.csv"
-            output_path = output_dir / filename
-            export_eds_spectrum(
-                output_path=output_path,
-                intensity=analyzer.spectra_data['total'],
-                offset=analyzer.parameters.get('OffsetEnergy', -250),
-                channels=4096,
-                dispension=5
-            )
-            self._log(f"  ✓ 谱图 CSV: {filename}")
-        except Exception as e:
-            self._log(f"  ✗ 导出谱图失败: {e}")
-            
-    def _export_colormix_lineprofile(self, analyzer, output_dir, filename_stem):
-        """导出 Color Mix 和 Line Profile"""
-        from velox_file_analyzer2 import (
-            save_color_mix_image, draw_line_profiles,
-            export_line_profile_as_csv
-        )
-        
-        quantification_mode = analyzer.parameters.get('quantification_mode', 'Unknown')
-        
-        # 导出带标注的 Color Mix
-        if self.eds_options['export_colormix'].get() and hasattr(analyzer, 'color_mix_image'):
-            try:
-                filename = f"{filename_stem}-Colormix-LineAnnotation.png"
-                output_path = output_dir / filename
-                
-                if self.colormix_options['with_annotation'].get() and hasattr(analyzer, 'line_position'):
-                    save_color_mix_image(
-                        analyzer.color_mix_image,
-                        output_path=output_path,
-                        line_info=analyzer.line_position,
-                        pixel_size=analyzer.parameters['pixelsize'],
-                        pixel_unit=analyzer.parameters['pixelunit']
-                    )
-                else:
-                    save_color_mix_image(
-                        analyzer.color_mix_image,
-                        output_path=output_path,
-                        pixel_size=analyzer.parameters['pixelsize'],
-                        pixel_unit=analyzer.parameters['pixelunit']
-                    )
-                self._log(f"  ✓ Color Mix (带标注): {filename}")
-            except Exception as e:
-                self._log(f"  ✗ 导出 Color Mix 失败: {e}")
-                
-        # 导出 Line Profile 图像
-        if self.export_options['png'].get() and hasattr(analyzer, 'line_profile_data'):
-            try:
-                filename = f"{filename_stem}-LineProfile.png"
-                output_path = output_dir / filename
-                draw_line_profiles(
-                    analyzer.line_profile_data,
-                    output_path=output_path,
-                    pixel_size=analyzer.parameters['pixelsize'],
-                    pixel_unit=analyzer.parameters['pixelunit'],
-                    line_length_px=analyzer.line_position.get('length') if hasattr(analyzer, 'line_position') else None
-                )
-                self._log(f"  ✓ Line Profile 图像: {filename}")
-            except Exception as e:
-                self._log(f"  ✗ 导出 Line Profile 图像失败: {e}")
-                
-        # 导出 Line Profile CSV
-        if self.export_options['csv'].get() and hasattr(analyzer, 'line_profile_data'):
-            try:
-                filename = f"{filename_stem}-LineProfile.csv"
-                output_path = output_dir / filename
-                export_line_profile_as_csv(
-                    output_path,
-                    line_length_pixel=analyzer.line_position.get('length') if hasattr(analyzer, 'line_position') else None,
-                    line_profile=analyzer.line_profile_data,
-                    pixelsize=analyzer.parameters['pixelsize'],
-                    pixelunit=analyzer.parameters['pixelunit'],
-                    quantification_mode=quantification_mode
-                )
-                self._log(f"  ✓ Line Profile CSV: {filename}")
-            except Exception as e:
-                self._log(f"  ✗ 导出 Line Profile CSV 失败: {e}")
-                
-    def _export_tem(self, analyzer, output_dir, filename_stem):
-        """导出 TEM 图像"""
-        self._export_generic_image(
-            analyzer, output_dir, filename_stem,
-            'Ceta', analyzer.tem_data, analyzer.tem_metadata
-        )
-        
-    def _export_stem(self, analyzer, output_dir, filename_stem):
-        """导出 STEM 图像"""
-        for key in analyzer.stem_data.keys():
-            params = analyzer.parameters.get(key, {})
-            self._export_generic_image(
-                analyzer, output_dir, filename_stem,
-                key, analyzer.stem_data[key], analyzer.stem_metadata.get(key, {}),
-                suffix=key
-            )
-            
-    def _export_dpc(self, analyzer, output_dir, filename_stem):
-        """导出 DPC 图像"""
-        for key in analyzer.dpc_data.keys():
-            params = analyzer.parameters.get(key, {})
-            self._export_generic_image(
-                analyzer, output_dir, filename_stem,
-                key, analyzer.dpc_data[key], analyzer.dpc_metadata.get(key, {}),
-                suffix=key
-            )
-            
-    def _export_dcfi(self, analyzer, output_dir, filename_stem):
-        """导出 DCFI 图像"""
-        params = analyzer.parameters.get('DCFI', {})
-        image_name = params.get('image_name', f"{filename_stem}-DCFI")
-        self._export_generic_image(
-            analyzer, output_dir, filename_stem,
-            'DCFI', analyzer.dcfi_data, {},
-            custom_name=image_name
-        )
-        
-    def _export_crop(self, analyzer, output_dir, filename_stem):
-        """导出裁剪图像"""
-        params = analyzer.parameters.get('crop', {})
-        image_name = params.get('image_name', f"{filename_stem}-Crop")
-        self._export_generic_image(
-            analyzer, output_dir, filename_stem,
-            'crop', analyzer.crop_data, analyzer.crop_metadata,
-            custom_name=image_name
-        )
-        
-    def _export_filtered(self, analyzer, output_dir, filename_stem):
-        """导出滤波图像"""
-        params = analyzer.parameters.get('filter', {})
-        image_name = params.get('image_name', f"{filename_stem}-Filtered")
-        self._export_generic_image(
-            analyzer, output_dir, filename_stem,
-            'filter', analyzer.filter_data, analyzer.filter_metadata,
-            custom_name=image_name
-        )
-        
-    def _export_generic_image(self, analyzer, output_dir, filename_stem, 
-                              param_key, data, metadata, suffix=None, custom_name=None):
-        """通用图像导出方法"""
-        from velox_file_analyzer2 import dm5_writer, save_as_16bit_tiff, save_image_as_png
-        
-        params = analyzer.parameters.get(param_key, {}) if isinstance(analyzer.parameters.get(param_key), dict) else {}
-        
-        if custom_name:
-            filename = custom_name
-        elif suffix:
-            filename = f"{filename_stem}-{suffix}"
-        else:
-            filename = filename_stem
-            
-        output_path = output_dir / filename
-        
-        try:
-            signal = {
-                'data': data,
-                'metadata': metadata,
-                'color': {'blue': 1, 'green': 1, 'red': 1},
-                'display_range': params.get('display_range', [0, 1]),
-                'gamma': params.get('gamma', 1.0)
-            }
-            
-            # DM5
-            if self.export_options['dm5'].get():
-                dm5_data = data
-                if dm5_data.ndim == 2:
-                    dm5_data = dm5_data[..., np.newaxis]
-                signal['data'] = dm5_data
-                dm5_writer(add_suffix_safe(output_path, '.dm5'), signal, params if params else analyzer.parameters)
-                self._log(f"  ✓ DM5: {filename}.dm5")
-                
-            # TIFF
-            if self.export_options['tiff'].get():
-                imagej_metadata = {
-                    'ImageJ': '1.54g',
-                    'unit': params.get('pixelunit', 'nm').replace('μ', 'u') if params else 'nm',
-                    'spacing': params.get('pixelsize', 1.0) if params else 1.0
-                }
-                if data.ndim == 3:
-                    imagej_metadata['slices'] = data.shape[-1]
-                save_as_16bit_tiff(data, output_path, metadata=imagej_metadata)
-                self._log(f"  ✓ TIFF: {filename}.tif")
-                
-            # PNG
-            if self.export_options['png'].get():
-                if data.ndim == 2:
-                    save_image_as_png(
-                        image=data,
-                        output_path=add_suffix_safe(output_path, '.png'),
-                        pixel_size=params.get('pixelsize', 1.0) if params else 1.0,
-                        pixel_unit=params.get('pixelunit', 'nm') if params else 'nm',
-                        display_range=params.get('display_range'),
-                        gamma=params.get('gamma', 1.0),
-                        add_scalebar=True
-                    )
-                elif data.ndim == 3:
-                    save_image_as_png(
-                        image=data,
-                        output_path=add_suffix_safe(output_path, '.png'),
-                        pixel_size=params.get('pixelsize', 1.0) if params else 1.0,
-                        pixel_unit=params.get('pixelunit', 'nm') if params else 'nm',
-                        display_range=params.get('display_range'),
-                        gamma=params.get('gamma', 1.0),
-                        display_index=params.get('display_index', 0),
-                        add_scalebar=True
-                    )
-                self._log(f"  ✓ PNG: {filename}.png")
-                
-        except Exception as e:
-            self._log(f"  ✗ 导出 {filename} 失败: {e}")
-
-
 def main():
     """主函数"""
     root = Tk()
