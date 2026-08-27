@@ -1,7 +1,7 @@
 name: Build Windows EXE
 
 # 手动触发：Actions -> Build Windows EXE -> Run workflow
-# 或在推送 v* 标签时自动触发
+# 或在推送 v* 标签时自动触发（测试通过后构建）
 on:
   workflow_dispatch:
     inputs:
@@ -14,8 +14,32 @@ on:
       - 'v*'
 
 jobs:
+  test:
+    name: pytest (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+
+      - name: Run tests
+        run: |
+          python -m pytest tests/ -v
+
   build:
+    name: PyInstaller (Windows)
     runs-on: windows-latest
+    needs: test
     timeout-minutes: 60
     steps:
       - name: Checkout
@@ -43,11 +67,9 @@ jobs:
             --collect-all tifffile `
             emd_converter_gui.py
 
-      - name: Smoke test (import + instantiate analyzer on schema-only check)
+      - name: List artifact
         shell: pwsh
         run: |
-          # 仅验证 exe 能启动 GUI 主程序（无显示器环境下无法开窗，这里跳过 GUI；
-          # 依赖完整性由 PyInstaller 构建日志保证）。列出产物大小即可。
           Get-Item dist/*.exe | Select-Object Name, @{N='SizeMB';E={[math]::Round($_.Length/1MB,1)}}
 
       - name: Upload artifact
