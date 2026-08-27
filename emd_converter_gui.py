@@ -508,11 +508,13 @@ EMD 文件批量转换工具 v1.0
         """处理所有文件"""
         total = len(self.file_list)
         output_base = Path(self.output_dir.get())
+        success_count = 0
+        failed = []  # (文件名, 错误信息)
         
         for idx, file_path in enumerate(self.file_list, 1):
             if not self.is_processing:
                 break
-                
+            analyzer = None
             try:
                 self.root.after(0, lambda i=idx, t=total: self._update_progress(i, t, f"正在处理: {Path(file_path).name}"))
                 self._log(f"\n{'='*50}")
@@ -529,13 +531,23 @@ EMD 文件批量转换工具 v1.0
                 self._export_by_type(analyzer, file_output_dir)
                 
                 self._log(f"完成: {Path(file_path).name}")
+                success_count += 1
                 
             except Exception as e:
-                self._log(f"错误: 处理 {Path(file_path).name} 时出错: {str(e)}")
                 import traceback
+                self._log(f"错误: 处理 {Path(file_path).name} 时出错: {e}")
                 self._log(traceback.format_exc())
+                # 单文件失败不中断整个批量，记录以便汇总
+                failed.append((Path(file_path).name, str(e)))
+            finally:
+                # 确保 h5py 句柄释放（Windows 下未关闭的句柄会锁住文件，导致重试失败）
+                if analyzer is not None:
+                    try:
+                        analyzer.f.close()
+                    except Exception:
+                        pass
                 
-        self.root.after(0, self._conversion_finished)
+        self.root.after(0, lambda: self._conversion_finished(success_count, failed))
         
     def _update_progress(self, current, total, message):
         """更新进度"""
@@ -543,16 +555,22 @@ EMD 文件批量转换工具 v1.0
         self.progress_var.set(progress)
         self.progress_label.config(text=f"{message} ({current}/{total})")
         
-    def _conversion_finished(self):
+    def _conversion_finished(self, success_count=0, failed=None):
         """转换完成回调"""
         self.is_processing = False
         self.btn_start.config(state='normal')
         self.btn_stop.config(state='disabled')
         self.progress_var.set(100)
-        self.progress_label.config(text="处理完成")
+        failed = failed or []
+        if failed:
+            self.progress_label.config(text=f"处理完成（成功{success_count}，失败{len(failed)}）")
+        else:
+            self.progress_label.config(text="处理完成")
         self._log(f"\n{'='*50}")
-        self._log("所有文件处理完成!")
-        messagebox.showinfo("完成", "EMD 文件转换完成!")
+        self._log(f"处理完成: 成功 {success_count} 个，失败 {len(failed)} 个")
+        for name, err in failed:
+            self._log(f"  ✗ {name}: {err}")
+        messagebox.showinfo("完成", f"EMD 文件转换完成！\n成功: {success_count}\n失败: {len(failed)}")
         
     def _export_by_type(self, analyzer, output_dir):
         """根据文件类型执行导出"""
@@ -667,10 +685,12 @@ EMD 文件批量转换工具 v1.0
                         
                     # TIFF
                     if self.export_options['tiff'].get():
+                        pixelunit = analyzer.parameters.get('pixelunit', 'nm')
+                        pixelsize = analyzer.parameters.get('pixelsize', 1.0)
                         imagej_metadata = {
                             'ImageJ': '1.54g',
-                            'unit': analyzer.parameters['pixelunit'].replace('μ', 'u'),
-                            'spacing': analyzer.parameters['pixelsize']
+                            'unit': str(pixelunit).replace('μ', 'u'),
+                            'spacing': float(pixelsize)
                         }
                         if data.ndim == 3:
                             imagej_metadata['slices'] = data.shape[-1]

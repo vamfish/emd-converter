@@ -1177,8 +1177,8 @@ def dm5_writer(filename, signal, parameters):
     elif data.dtype == 'int16':
         datatype = np.uint32(1) # 1 代表 signed int，10 代表 unsigned int
         pixeldepth = np.uint32(2) # 2 bytes 对应 16 bits
-    pixelsize = np.float32(parameters['pixelsize'])
-    pixelunit = np.bytes_(parameters['pixelunit'].encode('gb2312')) # 中文系统不能用 utf-8
+    pixelsize = np.float32(parameters.get('pixelsize', 1.0))
+    pixelunit = np.bytes_(str(parameters.get('pixelunit', 'px')).encode('gb2312')) # 中文系统不能用 utf-8
     keys_to_remove = {'data', 'metadata'}
     display_metadata = {k: v for k, v in signal.items() if k not in keys_to_remove}
     # 确定 image_display_info.attrs['HighLimit'] and ['LowLimit']
@@ -2184,9 +2184,12 @@ class VeloxFileAnalyzer:
         try:
             self.f = h5py.File(file_path, 'r')
         except OSError:
-            print("[ERROR] 文件已经被其他软件打开")
+            if os.path.exists(file_path):
+                print("[ERROR] 文件无法打开，可能已损坏或被其他软件占用")
+            else:
+                print(f"[ERROR] 文件不存在: {file_path}")
         if not hasattr(self, 'f'):
-            raise ValueError("[ERROR] 文件已经被其他软件打开")
+            raise ValueError("[ERROR] 文件无法打开，可能已损坏或被其他软件占用")
         self.features = bytes_to_json(self.f['Features']['Features'])['features']
         
         # 初始化各特征路径
@@ -3763,22 +3766,27 @@ class VeloxFileAnalyzer:
     # ========================================================================
     
     def _get_pixel_size(self, metadata):
-        """从元数据中获取像素大小和单位。"""
-        pixel_size = float(metadata['BinaryResult']['PixelSize']['width'])
-        pixel_unit = metadata['BinaryResult']['PixelUnitX']
-        
-        # 转换单位
-        if metadata['BinaryResult']['PixelUnitX'] == 'm':
-            pixel_size *= 1e9
-            pixel_unit = 'nm'
-            if pixel_size >= 10.0:
-                pixel_size /= 1e3
-                pixel_unit = 'μm'
-        if metadata['BinaryResult']['PixelUnitX'] == '1/m':
-            pixel_size /= 1e9
-            pixel_unit = '1/nm'
-        
-        return (pixel_size, pixel_unit)
+        """从元数据中获取像素大小和单位（缺失时降级为 1.0 / 'px'）。"""
+        try:
+            br = metadata['BinaryResult']
+            pixel_size = float(br['PixelSize']['width'])
+            pixel_unit = br['PixelUnitX']
+            
+            # 转换单位
+            if br['PixelUnitX'] == 'm':
+                pixel_size *= 1e9
+                pixel_unit = 'nm'
+                if pixel_size >= 10.0:
+                    pixel_size /= 1e3
+                    pixel_unit = 'μm'
+            if br['PixelUnitX'] == '1/m':
+                pixel_size /= 1e9
+                pixel_unit = '1/nm'
+            
+            return (pixel_size, pixel_unit)
+        except (KeyError, TypeError, ValueError):
+            # 元数据缺失/损坏时降级，避免后续导出整批失败
+            return (1.0, 'px')
     
     def _update_parameters(self, new_parameters):
         """更新参数字典。"""
