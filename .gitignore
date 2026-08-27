@@ -48,3 +48,10 @@ Desktop.ini
 *.tmp
 temp/
 tmp/
+
+# 本地测试数据（不提交到仓库）
+test_data/
+
+# Agent 项目说明（本地保留，不同步到远程）
+AGENT.md
+

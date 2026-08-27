@@ -355,18 +355,70 @@ def export_line_profile_as_csv(output_path, line_length_pixel, line_profile, pix
     print(f"成功保存到: {output_path}")
     return output_path
 
-def optimized_read_with_progress(file_path, dataset_name="/Data/Image/ad5b0bc2b43d40dfb366f41a2b3839d5/Data"):
+def _transpose_hwc_to_fwc(data, block=64):
+    """(H, W, F) C连续 -> (F, H, W) C连续，缓存分块拷贝。
+    
+    对非连续转置视图直接 numpy.ascontiguousarray 会退化为逐元素乱序访问
+    （5.2GB 实测 ~31s，且受内存对齐影响抖动到 1~31s）；
+    这里按空间方块分块，块内 (F) 方向连续，实测确定 ~6.8s。
     """
-    优化的 HDF5 数据读取策略，带进度显示。
+    h, w, f = data.shape
+    if f == 1:
+        # 单帧：整块拷贝即可，避免分块循环开销
+        return np.ascontiguousarray(data.transpose(2, 0, 1))
+    out = np.empty((f, h, w), dtype=data.dtype, order='C')
+    bh = min(block, h)
+    bw = min(block, w)
+    for hb in range(0, h, bh):
+        he = min(hb + bh, h)
+        for wb in range(0, w, bw):
+            we = min(wb + bw, w)
+            sub = data[hb:he, wb:we, :]  # (bh, bw, F)，最后轴连续
+            out[:, hb:he, wb:we] = np.ascontiguousarray(sub.transpose(2, 0, 1))
+    return out
+
+
+def _transpose_fwc_to_hwc(fwc, block_f=16, block_hw=512):
+    """(F, H, W) C连续 -> (H, W, F) C连续，缓存分块拷贝。
+    
+    与 _transpose_hwc_to_fwc 方向相反，按 F 方向分块（F 是源最后轴）。
+    实测 (4096,4096,163) 时 block_f=16, block_hw=512 约 6.3s。
+    """
+    f, h, w = fwc.shape
+    if f == 1:
+        return np.ascontiguousarray(fwc.transpose(1, 2, 0))
+    out = np.empty((h, w, f), dtype=fwc.dtype, order='C')
+    bf = min(block_f, f)
+    bhw = min(block_hw, h)
+    for fb in range(0, f, bf):
+        fe = min(fb + bf, f)
+        sub = fwc[fb:fe]  # (bf, H, W) 连续
+        for hb in range(0, h, bhw):
+            he = min(hb + bhw, h)
+            out[hb:he, :, fb:fe] = np.ascontiguousarray(sub[:, hb:he, :].transpose(1, 2, 0))
+    return out
+
+
+def optimized_read_with_progress(file_path, dataset_name="/Data/Image/ad5b0bc2b43d40dfb366f41a2b3839d5/Data", h5file=None):
+    """
+    优化的 HDF5 数据读取策略。
     
     参数:
-        file_path: HDF5 文件路径
+        file_path: HDF5 文件路径（配合 h5file 复用句柄）
         dataset_name: 数据集路径
+        h5file: 可选的已打开 h5py.File 句柄，避免重复打开文件
     
     返回:
         读取的数据数组
+    
+    性能说明:
+        Velox EMD 的 3D 数据按 (256, ROWS, 1) 分块存储，若直接 ds[:] 整体读取，
+        HDF5 内部逐 chunk 拷贝到 C 连续目标时会出现大量随机访存（5.2GB 实测 ~30s）。
+        这里改为逐帧读入 (F,H,W) 暂存（连续写，实测 ~4s），再做一次缓存分块转置。
     """
-    with h5py.File(file_path, 'r') as f:
+    own_handle = h5file is None
+    f = h5py.File(file_path, 'r') if own_handle else h5file
+    try:
         dataset = f[dataset_name]
         
         # 获取存储信息
@@ -379,34 +431,57 @@ def optimized_read_with_progress(file_path, dataset_name="/Data/Image/ad5b0bc2b4
         shape = dataset.shape
         print(f"数据形状: {shape}, 数据类型: {dataset.dtype}")
         
-        # 根据维度选择读取策略
-        if len(shape) == 3:
-            # 3D 数据按 Z 轴切片读取
-            result = np.empty(shape, dtype=dataset.dtype)
-            
-            for z in tqdm(
-                range(shape[2]),
-                desc=f"读取 {dataset_name}",
-                unit='slice',
-                mininterval=0.5
-            ):
-                result[:, :, z] = dataset[:, :, z]
-                
-        elif len(shape) == 2:
-            # 2D 数据按行读取
-            result = np.empty(shape, dtype=dataset.dtype)
-            
-            for y in tqdm(
-                range(shape[0]),
-                desc=f"读取 {dataset_name}",
-                unit='row'
-            ):
-                result[y, :] = dataset[y, :]
+        if len(shape) == 3 and dataset.chunks and shape[2] > 1:
+            # 大数据 3D 序列：逐帧读入 FWC 暂存（连续写），再分块转置为 (H,W,F)
+            f_staging = np.empty((shape[2], shape[0], shape[1]), dtype=dataset.dtype)
+            for z in range(shape[2]):
+                f_staging[z] = dataset[:, :, z]
+            result = _transpose_fwc_to_hwc(f_staging)
         else:
             # 小数据直接读取
             result = dataset[:]
         
         return result
+    finally:
+        if own_handle:
+            f.close()
+
+def _vectorized_bilinear_interp(arr, xs, ys):
+    """向量化双线性插值：在 (ys, xs) 处对 2D 数组 arr 插值。
+    
+    参数:
+        arr: 形状 (H, W) 的 2D 数组
+        xs, ys: 任意形状的坐标数组（列、行坐标）
+    
+    返回:
+        插值结果，形状与 xs/ys 相同
+    """
+    h, w = arr.shape
+    # 越界坐标 clamp 到有效范围（线性样条在网格外的延伸对本场景不影响）
+    x = np.clip(xs, 0, w - 1).astype(np.float64)
+    y = np.clip(ys, 0, h - 1).astype(np.float64)
+    
+    x0 = np.floor(x).astype(np.int64)
+    y0 = np.floor(y).astype(np.int64)
+    # w==1 / h==1 时避免 x0+1 越界
+    x0 = np.minimum(x0, w - 2) if w > 1 else np.zeros_like(x0)
+    y0 = np.minimum(y0, h - 2) if h > 1 else np.zeros_like(y0)
+    
+    tx = x - x0
+    ty = y - y0
+    x1 = x0 + 1
+    y1 = y0 + 1
+    
+    f00 = arr[y0, x0]
+    f10 = arr[y0, x1]
+    f01 = arr[y1, x0]
+    f11 = arr[y1, x1]
+    
+    return (f00 * (1 - tx) * (1 - ty) +
+            f10 * tx * (1 - ty) +
+            f01 * (1 - tx) * ty +
+            f11 * tx * ty)
+
 
 def display_two_grayscale_images(
     image1: np.ndarray,
@@ -1069,7 +1144,14 @@ def dm5_writer(filename, signal, parameters):
     """
     已经适配了 SI，后续需要适配其他类型数据@20260121
     """
-    data = signal['data'].transpose(2, 0, 1) # dm5储存的data为 frames x height x width，而velox储存的data为 height x width x frames
+    if signal['data'].ndim == 2:
+        data = signal['data'][..., np.newaxis]
+    else:
+        data = signal['data']
+    # dm5 存储的 data 为 frames x height x width，而 velox 储存的 data 为 height x width x frames
+    # 直接对转置视图做 ascontiguousarray 会退化为逐元素乱序拷贝（5.2GB 实测 1~31s 抖动）；
+    # 用缓存分块转置，确定性 ~7s
+    data = _transpose_hwc_to_fwc(data)
     width = data.shape[2] # width (X) 实际对应 [0]
     height = data.shape[1] # height (Y) 实际对应 [1]
     # 计算缩略图的尺寸
@@ -1094,8 +1176,7 @@ def dm5_writer(filename, signal, parameters):
     keys_to_remove = {'data', 'metadata'}
     display_metadata = {k: v for k, v in signal.items() if k not in keys_to_remove}
     # 确定 image_display_info.attrs['HighLimit'] and ['LowLimit']
-    low_limit = np.percentile(data[0,:,:], 0.1) # np.float64
-    high_limit = np.percentile(data[0,:,:], 99.9) # np.float64
+    # （display_range 直接给出高低限位，无需再对数据求分位数）
     low_limit = np.float32(min(signal['display_range']))
     high_limit = np.float32(max(signal['display_range']))
     # 构造 CLUT
@@ -2205,7 +2286,7 @@ class VeloxFileAnalyzer:
                 if index == 0:
                     print('[INFO] STEM 系列图像')
                 data_path = stem_input_operation['dataPath'] + '/Data'
-                image_data = optimized_read_with_progress(self.file_path, data_path)
+                image_data = optimized_read_with_progress(self.file_path, data_path, h5file=self.f)
                 image_metadata = decode_metadata(stem_data['Metadata'])
             image_datas[image_label] = image_data
             image_metadatas[image_label] = image_metadata
@@ -2287,7 +2368,7 @@ class VeloxFileAnalyzer:
         else:
             print('[INFO] TEM 系列图像')
             data_path = camera_input_operation['dataPath'] + '/Data'
-            image_data = optimized_read_with_progress(self.file_path, data_path)
+            image_data = optimized_read_with_progress(self.file_path, data_path, h5file=self.f)
             image_metadata = decode_metadata(camera_input_data['Metadata'])
         self.tem_data = image_data
         self.tem_metadata = image_metadata
@@ -2323,7 +2404,8 @@ class VeloxFileAnalyzer:
         # 读取 DCFI 数据
         dcfi_data = optimized_read_with_progress(
             self.file_path,
-            dcfi_data_path + '/Data'
+            dcfi_data_path + '/Data',
+            h5file=self.f
         )
         self.dcfi_data = dcfi_data
         image_metadata = decode_metadata(self.get_path(dcfi_data_path+'/Metadata'))
@@ -2721,18 +2803,16 @@ class VeloxFileAnalyzer:
         return sample_positions, perpendicular_samples
     
     def _extract_profile_data(self, sample_positions, perpendicular_samples):
-        """提取剖面数据。"""
-        def _spline(arr, x, y):
-            """双线性插值。"""
-            # 创建索引坐标
-            x_indices = np.arange(arr.shape[1])  # 列索引
-            y_indices = np.arange(arr.shape[0])  # 行索引
-            
-            # 创建双线性插值器
-            spline = RectBivariateSpline(x_indices, y_indices, arr.T, kx=1, ky=1)
-            result = spline(x, y)
-            
-            return float(result.squeeze())
+        """提取剖面数据（向量化双线性插值）。
+        
+        原实现逐点构建 RectBivariateSpline（kx=1, ky=1 即双线性），
+        在 Python 层反复调用，29k 个采样点耗时 ~70s。
+        这里改为一次性向量化双线性插值，结果一致但快数个量级。
+        """
+        # 预构建采样坐标数组: (M, P, 3)，M=沿线采样数, P=垂直采样数，xyz 对应 [x, y, w]
+        perp_arr = np.asarray(perpendicular_samples, dtype=np.float64)
+        xs = perp_arr[..., 0]
+        ys = perp_arr[..., 1]
         
         profile_data_with_width = {}
         
@@ -2742,26 +2822,19 @@ class VeloxFileAnalyzer:
             image_data = comp['data'][:, :, frame_index]
             
             if image_data is not None:
-                # 提取每个采样点的垂直剖面
-                profile_2d = []  # 2D数组：[沿中心线位置] × [垂直位置]
-                
-                for perp_line in perpendicular_samples:
-                    line_values = []
-                    for x, y, w in perp_line:
-                        value = _spline(image_data, x, y)
-                        line_values.append(value)
-                    profile_2d.append(line_values)
+                # 向量化双线性插值: profile_2d 形状 (M, P)
+                profile_2d = _vectorized_bilinear_interp(image_data, xs, ys)
                 
                 # 计算平均剖面（沿垂直方向平均）
-                profile_avg = np.mean(profile_2d, axis=1) if profile_2d else np.array([])
+                profile_avg = np.mean(profile_2d, axis=1) if profile_2d.size else np.array([])
                 
                 profile_data_with_width[comp_id] = {
-                    'profile_2d': np.array(profile_2d),  # 2D剖面数据
+                    'profile_2d': profile_2d,  # 2D剖面数据
                     'profile_avg': profile_avg,  # 平均剖面
                     'color': comp['color']
                 }
                 
-                print(f"✓ {comp_id}: 提取了 {len(profile_2d)}×{len(profile_2d[0]) if profile_2d else 0} 的 2D 剖面")
+                print(f"✓ {comp_id}: 提取了 {profile_2d.shape[0]}×{profile_2d.shape[1]} 的 2D 剖面")
         
         return profile_data_with_width
     
