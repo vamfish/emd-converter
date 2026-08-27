@@ -882,9 +882,16 @@ def draw_line_profiles(profiles_data, output_path: str = None, pixel_size=1.0, p
     # 添加网格
     ax_left.grid(True, alpha=0.3)
     
-    # 添加图例
-    ax_left.legend(loc='best', fontsize=10)
-    ax_right.legend(loc='best', fontsize=10)
+    # 添加图例：合并左右两轴为单一图例
+    # （若对 twinx 的两个轴各自调用 legend(loc='best')，matplotlib 只会
+    # 避开本轴数据、看不到另一轴的图例，两个图例会选同一位置互相重叠）
+    all_lines = left_lines + right_lines
+    ax_left.legend(
+        all_lines,
+        [line.get_label() for line in all_lines],
+        loc='best',
+        fontsize=10
+    )
     
     plt.tight_layout()
     
