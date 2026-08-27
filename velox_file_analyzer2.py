@@ -387,15 +387,36 @@ def _transpose_fwc_to_hwc(fwc, block_f=16, block_hw=512):
     if f == 1:
         return np.ascontiguousarray(fwc.transpose(1, 2, 0))
     out = np.empty((h, w, f), dtype=fwc.dtype, order='C')
-    bf = min(block_f, f)
-    bhw = min(block_hw, h)
-    for fb in range(0, f, bf):
-        fe = min(fb + bf, f)
-        sub = fwc[fb:fe]  # (bf, H, W) 连续
-        for hb in range(0, h, bhw):
-            he = min(hb + bhw, h)
-            out[hb:he, :, fb:fe] = np.ascontiguousarray(sub[:, hb:he, :].transpose(1, 2, 0))
+    _transpose_fwc_to_hwc_into(fwc, out, 0)
     return out
+
+
+def _transpose_fwc_to_hwc_into(fwc, out, fb, block_hw=512):
+    """把 (G, H, W) 的帧组 fwc 分块转置写入 out[:, :, fb:fb+G]（HWC 目标）。
+    
+    用于大序列读入时分帧组转置，避免一次性分配整块 (F,H,W) 暂存。
+    """
+    g, h, w = fwc.shape
+    bhw = min(block_hw, h)
+    for hb in range(0, h, bhw):
+        he = min(hb + bhw, h)
+        out[hb:he, :, fb:fb + g] = np.ascontiguousarray(
+            fwc[:, hb:he, :].transpose(1, 2, 0))
+
+
+_READ_FRAME_GROUP = 16  # 读取时分帧组大小（每阶段额外内存 = 组帧数 × 单帧字节）
+
+
+def _warn_low_memory(data_bytes: int) -> None:
+    """低内存告警（不阻断，仅提示；psutil 缺失时静默）。"""
+    try:
+        import psutil
+        avail = psutil.virtual_memory().available
+        if avail < data_bytes * 1.6:
+            print(f"[WARN] 系统可用内存不足（可用 {avail/2**30:.1f} GB，"
+                  f"当前数据约 {data_bytes/2**30:.1f} GB），建议仅导出 DM5 并关闭其他程序")
+    except ImportError:
+        pass
 
 
 def optimized_read_with_progress(file_path, dataset_name="/Data/Image/ad5b0bc2b43d40dfb366f41a2b3839d5/Data", h5file=None):
@@ -413,7 +434,7 @@ def optimized_read_with_progress(file_path, dataset_name="/Data/Image/ad5b0bc2b4
     性能说明:
         Velox EMD 的 3D 数据按 (256, ROWS, 1) 分块存储，若直接 ds[:] 整体读取，
         HDF5 内部逐 chunk 拷贝到 C 连续目标时会出现大量随机访存（5.2GB 实测 ~30s）。
-        这里改为逐帧读入 (F,H,W) 暂存（连续写，实测 ~4s），再做一次缓存分块转置。
+        这里按帧组（8 帧）读入、分块转置写回，速度接近整体读且峰值内存 = 数据量×1.05。
     """
     own_handle = h5file is None
     f = h5py.File(file_path, 'r') if own_handle else h5file
@@ -431,11 +452,16 @@ def optimized_read_with_progress(file_path, dataset_name="/Data/Image/ad5b0bc2b4
         print(f"数据形状: {shape}, 数据类型: {dataset.dtype}")
         
         if len(shape) == 3 and dataset.chunks and shape[2] > 1:
-            # 大数据 3D 序列：逐帧读入 FWC 暂存（连续写），再分块转置为 (H,W,F)
-            f_staging = np.empty((shape[2], shape[0], shape[1]), dtype=dataset.dtype)
-            for z in range(shape[2]):
-                f_staging[z] = dataset[:, :, z]
-            result = _transpose_fwc_to_hwc(f_staging)
+            # 大数据 3D 序列：按帧组分块读入 HWC 结果，避免一次性分配 (F,H,W) 暂存
+            f_cnt, h, w = shape[2], shape[0], shape[1]
+            result = np.empty((h, w, f_cnt), dtype=dataset.dtype)
+            _warn_low_memory(result.nbytes)
+            for fb in range(0, f_cnt, _READ_FRAME_GROUP):
+                fe = min(fb + _READ_FRAME_GROUP, f_cnt)
+                staging = np.empty((fe - fb, h, w), dtype=dataset.dtype)
+                for i in range(fb, fe):
+                    staging[i - fb] = dataset[:, :, i]
+                _transpose_fwc_to_hwc_into(staging, result, fb)
         else:
             # 小数据直接读取
             result = dataset[:]
@@ -1146,20 +1172,58 @@ def convert_int16_to_uint16(data, method='direct'):
     
     return uint16_data
 
+_DM5_STREAM_FRAMES = 8          # 流式写入默认帧组大小
+_DM5_FULL_WRITE_BYTES = 256 * 2**20  # 小于该字节数时整块写入
+
+
+def _choose_stream_group(src) -> int:
+    """根据可用内存决定写入/转置策略。
+    
+    返回 0 表示整块转置写入（速度最快，峰值内存约 2× 数据量）；
+    返回 >0 表示分帧组流式写入（组大小），峰值内存约 1× 数据量 + 组缓冲。
+    """
+    if src.ndim != 3 or src.shape[2] <= 1 or src.nbytes <= _DM5_FULL_WRITE_BYTES:
+        return 0
+    frame_bytes = src.shape[0] * src.shape[1] * src.dtype.itemsize
+    try:
+        import psutil
+        avail = psutil.virtual_memory().available
+    except ImportError:
+        avail = src.nbytes * 4  # 无 psutil 时乐观处理（走整块转置）
+    # 整块路径峰值 ≈ 2.0×数据量；改用流式省内存时，组缓冲预算 = 可用内存 - 数据量
+    if avail > src.nbytes * 2.5:
+        return 0
+    budget = max(int(avail - src.nbytes), 0)
+    group = max(int(budget // frame_bytes), _DM5_STREAM_FRAMES)
+    return min(group, 64)
+
+
+def _write_dm5_data(f, dset_path, src):
+    """把 (H, W, F) 源数据按 DM5 (F, H, W) 布局写入已创建的空数据集。"""
+    ds = f[dset_path]
+    h, w, fr = src.shape
+    group = _choose_stream_group(src)
+    if group == 0:
+        ds[:] = _transpose_hwc_to_fwc(src)
+        return
+    for fb in range(0, fr, group):
+        fe = min(fb + group, fr)
+        ds[fb:fe] = _transpose_hwc_to_fwc(src[:, :, fb:fe])
+
+
 def dm5_writer(filename, signal, parameters):
     """
     已经适配了 SI，后续需要适配其他类型数据@20260121
     """
     if signal['data'].ndim == 2:
-        data = signal['data'][..., np.newaxis]
+        src = signal['data'][..., np.newaxis]
     else:
-        data = signal['data']
+        src = signal['data']
     # dm5 存储的 data 为 frames x height x width，而 velox 储存的 data 为 height x width x frames
-    # 直接对转置视图做 ascontiguousarray 会退化为逐元素乱序拷贝（5.2GB 实测 1~31s 抖动）；
-    # 用缓存分块转置，确定性 ~7s
-    data = _transpose_hwc_to_fwc(data)
-    width = data.shape[2] # width (X) 实际对应 [0]
-    height = data.shape[1] # height (Y) 实际对应 [1]
+    # 尺寸/类型信息直接取自源布局 (H, W, F)，实际写入时再按帧组分块转置
+    # （整块 _transpose_hwc_to_fwc 会多占 = 数据量一份内存；分帧组写入时额外内存 = 组帧数×单帧）
+    height, width, frames = src.shape
+    data_dtype = src.dtype
     # 计算缩略图的尺寸
     width_0, height_0 = (384, 384)
     if width > height:
@@ -1167,14 +1231,14 @@ def dm5_writer(filename, signal, parameters):
     elif width < height:
         width_0 = int(384/height*width) # width (X) 实际对应 [0]
     # 获取 frames
-    frames = data.shape[0] # frames 实际对应 [2]
-    if data.dtype == 'uint16':
+    # frames 实际对应 [2]
+    if data_dtype == 'uint16':
         datatype = np.uint32(10) # 1 代表 signed int，10 代表 unsigned int
         pixeldepth = np.uint32(2) # 2 bytes 对应 16 bits
-    elif data.dtype == 'float32':
+    elif data_dtype == 'float32':
         datatype = np.uint32(2) # 2 代表 float
         pixeldepth = np.uint32(4) # 4 bytes 对应 32 bits
-    elif data.dtype == 'int16':
+    elif data_dtype == 'int16':
         datatype = np.uint32(1) # 1 代表 signed int，10 代表 unsigned int
         pixeldepth = np.uint32(2) # 2 bytes 对应 16 bits
     pixelsize = np.float32(parameters.get('pixelsize', 1.0))
@@ -1374,7 +1438,9 @@ def dm5_writer(filename, signal, parameters):
         img1_dimension['[2]'].attrs['Scale'] = np.float32(1.0)
         img1_dimension['[2]'].attrs['Units'] = np.bytes_(''.encode('utf-8'))
        #*# [1] image 的实际数据
-        img1_image_data.create_dataset('Data', data=data)
+        img1_image_data.create_dataset('Data', shape=(frames, height, width), dtype=data_dtype)
+        # 填充数据：小数据整块转置写入；大序列按帧组分块流式写（峰值内存 ≈ 组帧数×单帧）
+        _write_dm5_data(f, 'ImageList/[1]/ImageData/Data', src)
        #*# [1] image 的大小尺寸
         img1_image_data.create_group('Dimensions')
         img1_image_data['Dimensions'].attrs['[0]'] = np.uint32(width) # width (X) 实际对应 [0]

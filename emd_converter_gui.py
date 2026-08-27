@@ -533,6 +533,11 @@ EMD 文件批量转换工具 v1.0
                 self._log(f"完成: {Path(file_path).name}")
                 success_count += 1
                 
+            except MemoryError:
+                # 内存不足触底时专门提示处理方向（M3 内存策略）
+                self._log(f"错误: 处理 {Path(file_path).name} 时内存不足，"
+                          f"建议仅导出 DM5 并关闭其他程序后重试")
+                failed.append((Path(file_path).name, "内存不足"))
             except Exception as e:
                 import traceback
                 self._log(f"错误: 处理 {Path(file_path).name} 时出错: {e}")

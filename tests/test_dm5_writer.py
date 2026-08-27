@@ -66,3 +66,32 @@ def test_thumbnail_present(tmp_path):
     with h5py.File(out, 'r') as f:
         thumb = f['ImageList/[0]/ImageData/Data']
         assert thumb.shape[0] <= 384 and thumb.shape[1] <= 384
+
+
+def test_choose_stream_group(monkeypatch):
+    """内存自适应：充足时整块(0)，吃紧时按可用内存选帧组。"""
+    import sys as _sys
+    import types as _types
+    from velox_file_analyzer2 import _choose_stream_group
+    monkeypatch.setattr('velox_file_analyzer2._DM5_FULL_WRITE_BYTES', 1024)
+
+    holder = {'avail': None}
+    fake = _types.ModuleType('psutil')
+    fake.virtual_memory = lambda: _types.SimpleNamespace(available=holder['avail'])
+    monkeypatch.setitem(_sys.modules, 'psutil', fake)
+
+    src = np.zeros((16, 16, 100), dtype=np.int16)
+    frame_bytes = 16 * 16 * 2
+
+    holder['avail'] = src.nbytes * 10
+    assert _choose_stream_group(src) == 0  # 充足 -> 整块
+
+    holder['avail'] = src.nbytes * 1.8
+    g = _choose_stream_group(src)
+    assert 0 < g <= 64
+    # 峰值 = 数据量 + 组缓冲，应明显小于整块路径的 2× 数据量
+    assert src.nbytes + g * frame_bytes < src.nbytes * 1.9
+
+    # 无 psutil 时乐观处理（整块）
+    monkeypatch.delitem(_sys.modules, 'psutil')
+    assert _choose_stream_group(src) == 0
