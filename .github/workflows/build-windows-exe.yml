@@ -85,6 +85,8 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write  # 创建 Release 资产需要写权限
     timeout-minutes: 20
     steps:
       - name: Checkout (tag)
