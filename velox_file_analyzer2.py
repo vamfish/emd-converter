@@ -123,6 +123,78 @@ def decode_metadata(metadata, need_print=False) -> Dict[str, Any]:
     
     return metadata_json
 
+def _display_angle(display: Dict[str, Any]) -> float:
+    """取 ImageDisplay 的显示旋转净角（**度**，CCW）：degrees(angle + offsetAngle)。
+
+    重要：ImageDisplay 的 angle/offsetAngle 字段实际以**弧度**存储——
+    Velox 顶部 "Image Rotation" 显示的度数即 degrees(angle)。
+    例：ddg 2026-09 样本 angle=-4.8072409 rad → UI 275.4°（等效 84.6° CCW）；
+    2026-02 旧批次 angle=0 → UI 0° → 不旋转。缺失/异常 → 0.0。
+    """
+    try:
+        rad = float(display.get('angle', 0) or 0) + float(display.get('offsetAngle', 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return math.degrees(rad)
+
+def apply_view_rotation(data, angle_deg: float = 0.0,
+                        inscribed_crop: bool = True) -> np.ndarray:
+    """
+    恢复 Velox 屏幕显示方向（适用于带非零显示旋转角的图像）。
+
+    取证结论（20260917-ddg + Velox 自身 TIFF 导出比对：方向相关系数 0.986，
+    内接方形裁剪尺寸 3758 与参考逐像素吻合）：
+    显示变换 = rotate(angle 字段按弧度换算的净度数)，旋转只作用于显示层，
+    EMD 存储数组从未旋转；导出时在此补上。
+    angle=0（2026-02 及更早批次、STEM/EDS 等）恒等返回，行为与旧版一致。
+
+    Args:
+        data: 2D (H,W) 或 3D (H,W,F) 数组（3D 时最后一维为帧，逐帧处理）
+        angle_deg: 显示净角（度，CCW 为正），由 _display_angle 换算得到
+        inscribed_crop: 含非 90° 整数倍残角时，裁到最大居中内接方形（去黑角）
+
+    Returns:
+        处理后的数组，dtype 与输入一致；90° 整数步无损（np.rot90），
+        残差角用双三次插值（逐帧 float64，瞬时内存≈单帧×4）。
+    """
+    data = np.asarray(data)
+    if data.ndim not in (2, 3):
+        raise ValueError(f"apply_view_rotation 需要 2D/3D 数组，当前形状 {data.shape}")
+    net = float(angle_deg or 0.0)
+    if abs(net) < 1e-9:
+        return data
+    n90 = int(np.round(net / 90.0))
+    residual = net - n90 * 90.0
+    work = np.rot90(data, n90) if n90 % 4 else data  # 无损 90° 步
+    if abs(residual) > 1e-9:
+        from scipy.ndimage import rotate
+        h, w = work.shape[0], work.shape[1]
+        side = 0
+        if inscribed_crop and h == w:
+            theta = abs(residual) * math.pi / 180.0
+            side = int(math.floor(h / (math.cos(theta) + math.sin(theta))))
+            if side <= 0 or side >= h:
+                side = 0
+        out_h, out_w = (side, side) if side else (h, w)
+        is3d = work.ndim == 3
+        out = np.empty((out_h, out_w, work.shape[2]) if is3d else (out_h, out_w),
+                       dtype=work.dtype)
+        y0 = (h - out_h) // 2
+        x0 = (w - out_w) // 2
+        frames = work.shape[2] if is3d else 1
+        for i in range(frames):
+            fr = work[:, :, i] if is3d else work
+            r = rotate(fr.astype(np.float64), residual, reshape=False, order=3,
+                       mode='constant', cval=0.0)
+            if side:
+                r = r[y0:y0 + side, x0:x0 + side]
+            if np.issubdtype(work.dtype, np.integer):
+                r = np.clip(np.rint(r), np.iinfo(work.dtype).min, np.iinfo(work.dtype).max)
+            target = out[..., i] if is3d else out
+            target[...] = r.astype(work.dtype)
+        work = out
+    return work
+
 def html_table_to_csv(
     html_content: str,
     output_path: Optional[str] = None,
@@ -835,10 +907,28 @@ def draw_line_annotation_on_image(color_image, line_info=None, pixel_size=1.0, p
     plt.tight_layout()
     return fig, ax
 
-def draw_line_profiles(profiles_data, output_path: str = None, pixel_size=1.0, pixel_unit='pixel', line_length_px=None, figsize=(12, 8)):
+def line_profile_ylabel(quantification_mode: str) -> str:
+    """按 EDS 定量模式返回元素侧纵轴标题（与 export_line_profile_as_csv 的表头同规则）。
+
+    Velox 四种模式 → 标题：Intensity→'Intensity (counts)'、NetIntensity→
+    'Net intensity (counts)'、WeightFraction→'Weight fraction (%)'、
+    AtomicFraction→'Atomic fraction (%)'。未识别时退回通用标题。
+    """
+    mode = quantification_mode or ''
+    if 'AtomicFraction' in mode:
+        return 'Atomic fraction (%)'
+    if 'WeightFraction' in mode:
+        return 'Weight fraction (%)'
+    if 'NetIntensity' in mode:
+        return 'Net intensity (counts)'
+    if 'Intensity' in mode:
+        return 'Intensity (counts)'
+    return 'Intensity of Elements'
+
+def draw_line_profiles(profiles_data, output_path: str = None, pixel_size=1.0, pixel_unit='pixel', line_length_px=None, figsize=(12, 8), quantification_mode: str = ''):
     """
     第二幅图：绘制多条线剖面图
-    
+
     参数:
         profiles_data: 线剖面数据列表，每个元素是一个一维数组
         output_path: 输出PNG文件路径
@@ -847,6 +937,7 @@ def draw_line_profiles(profiles_data, output_path: str = None, pixel_size=1.0, p
         profile_names: 每条剖面的名称列表
         line_length_px: 线的像素长度（用于计算物理距离）
         figsize: 图形大小
+        quantification_mode: EDS 定量模式（决定左纵轴标题/单位，见 line_profile_ylabel）
     """
     profiles = []
     colors = []
@@ -896,8 +987,8 @@ def draw_line_profiles(profiles_data, output_path: str = None, pixel_size=1.0, p
                     label=names[i])[0]
             left_lines.append(line)
     
-    # 设置坐标轴和标题
-    ax_left.set_ylabel('Intensity of Elements', fontsize=12, color='blue')
+    # 设置坐标轴和标题（左轴标题随定量模式：AtomicFraction → "Atomic fraction (%)" 等）
+    ax_left.set_ylabel(line_profile_ylabel(quantification_mode), fontsize=12, color='blue')
     ax_left.tick_params(axis='y', labelcolor='blue')
     ax_right.set_ylabel('Intensity of STEM Image', fontsize=12, color='red')
     ax_right.tick_params(axis='y', labelcolor='red')
@@ -907,18 +998,38 @@ def draw_line_profiles(profiles_data, output_path: str = None, pixel_size=1.0, p
     # 添加网格
     ax_left.grid(True, alpha=0.3)
     
-    # 添加图例：合并左右两轴为单一图例
-    # （若对 twinx 的两个轴各自调用 legend(loc='best')，matplotlib 只会
-    # 避开本轴数据、看不到另一轴的图例，两个图例会选同一位置互相重叠）
+    # 添加图例：合并左右两轴为单一图例，放到绘图区**右侧外部**
+    # （loc='best' 只避开左轴数据：右轴 STEM 曲线照样被挡，且常压在
+    #  右上角曲线上；外置右列彻底不遮数据，savefig 的 bbox_inches='tight'
+    #  会自动把图例纳入画布）
     all_lines = left_lines + right_lines
-    ax_left.legend(
+    leg = ax_left.legend(
         all_lines,
         [line.get_label() for line in all_lines],
-        loc='best',
-        fontsize=10
+        loc='upper left',
+        bbox_to_anchor=(1.02, 1.0),
+        fontsize=10,
+        framealpha=0.9
     )
-    
+
     plt.tight_layout()
+
+    # 右轴（twinx）的刻度数字也占据右侧空间：布局完成后实测其最右像素边界，
+    # 把图例再向右推到位（留 8px 余量），避免图例与刻度数字重叠。
+    # 必须在 tight_layout 之后测量——tight_layout 会移动坐标轴，先测后移会失效
+    try:
+        fig.canvas.draw()
+        renderer = fig.canvas.get_renderer()
+        tick_exts = [t.get_window_extent(renderer)
+                     for t in ax_right.get_yticklabels() if t.get_text()]
+        if tick_exts:
+            right_px = max(e.x1 for e in tick_exts) + 8
+            ax_bb = ax_left.get_window_extent(renderer)
+            needed_x = (right_px - ax_bb.x0) / ax_bb.width
+            if needed_x > 1.02:
+                leg.set_bbox_to_anchor((needed_x, 1.0))
+    except Exception:
+        pass  # 极端渲染环境下降级为固定锚点，不影响出图
     
     if output_path:
         # 处理输出路径
@@ -1534,6 +1645,40 @@ def create_metadata(d, tags):
             except:
                 print(f"{key}({type(key)}): {value}({type(value)})")
 
+def _scalebar_layout(height: int, scalebar_px: int, dpi: int = 300) -> tuple:
+    """底部边距标尺布局（随图幅等比）：返回 (字号pt, 厚度px, 边距区高度px)。
+
+    以 Velox 参考 TIFF 同阈值实测标定（3758px 图：文字墨迹带 154px≈4.10%、
+    条厚 19px≈0.5%、文字↔条间隙 27px）→ 字号 pt ≈ 0.0101*height 时与参考
+    逐像素吻合（见 tests/test_scalebar_layout.py）。
+
+    边距区高度按"字体 em 盒 + 条厚 + 上下间隙"计算（而非墨迹高）——此前按
+    墨迹估高，小图（如 512px 元素图）上字体行盒会超出边距区画进图像；
+    字号下限也从 10pt 降到 7pt，让低分辨率图的字按比例缩小。
+    """
+    fontsize_pt = float(np.clip(0.0101 * height, 7, 40))
+    thickness = int(np.clip(round(height * 0.005), 3, 24))
+    text_box_px = fontsize_pt * dpi / 72.0
+    gap = max(8.0, height * 0.016)
+    area_height = int(round(text_box_px + thickness + 2 * gap))
+    return fontsize_pt, thickness, area_height
+
+def _normalize_scalebar_unit(length, unit: str) -> tuple:
+    """把标尺物理量进位到易读单位：1000 nm→1 µm、5000 nm→5 µm、1000 µm→1 mm。
+
+    仅当值能被 1000 整除时逐级进位（pm/nm/µm/mm 链）；'um' 先归一为 'µm'。
+    返回 (新数值, 新单位)；不满足条件则原样返回。
+    """
+    val = float(length)
+    u = (unit or '').strip()
+    if u == 'um':
+        u = 'µm'
+    ladder = {'pm': 'nm', 'nm': 'µm', 'µm': 'mm'}
+    while u in ladder and val >= 1000.0 and abs(val % 1000.0) < 1e-9:
+        val /= 1000.0
+        u = ladder[u]
+    return val, u
+
 def save_image_as_png(
     image: np.ndarray,
     output_path: str,
@@ -1606,35 +1751,34 @@ def save_image_as_png(
         # 自动计算比例尺长度
         if add_scalebar and pixel_size != 1.0 and pixel_unit != 'pixel':
             if scalebar_length is None:
-                # 选择最接近图像宽度30%的标准长度
-                possible_lengths = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000]
+                # 最接近图像宽度 30% 的 1/2/5×10^k 整数。
+                # 旧表上限恰为 1000（nm 场景会原样打印 "1000 nm" 而非 1 µm）,
+                # 现在可选到 2000/5000 等，配合 _normalize_scalebar_unit 进位显示
                 target_length = phys_width * 0.3
-                scalebar_length = min(possible_lengths, key=lambda x: abs(x - target_length))
+                scalebar_length = min(
+                    (m * 10.0 ** e for e in range(0, 9) for m in (1.0, 2.0, 5.0)),
+                    key=lambda x: abs(x - target_length))
         
         # 计算比例尺在图像中的像素长度
         if add_scalebar:
-            scalebar_px = int(scalebar_length / pixel_size)
-            print(f"计算得到 scalebar 长度为 {scalebar_length} {pixel_unit} / {scalebar_px} pixels")
+            if scalebar_length is None:
+                # 无物理标定信息（如降级 pixel_size=1.0）时上方不会自动计算
+                # 比例尺长度，直接 None/float 会崩溃；此时跳过比例尺
+                print("无物理标定信息，跳过比例尺")
+                add_scalebar = False
+                scalebar_px = 0
+            else:
+                scalebar_px = int(scalebar_length / pixel_size)
+                print(f"计算得到 scalebar 长度为 {scalebar_length} {pixel_unit} / {scalebar_px} pixels")
         else:
             scalebar_px = 0
         
-        # 计算字体大小
-        fontsize_pt = height // 50
-        print(f"计算得到 font size 为 {fontsize_pt} pixels")
-        
-        # 计算比例尺厚度
+        # 字号/厚度/底部边距区：紧凑布局（对齐 Velox 显示，见 _scalebar_layout）
+        fontsize_pt, auto_thickness, auto_area_height = _scalebar_layout(height, scalebar_px, dpi)
         if scalebar_thickness is None:
-            # 基于图像高度和scalebar像素长度计算
-            scalebar_thickness = max(scalebar_px*0.15, int(height * 0.05))  # 图像高度的5%
-            print(f"计算得到 scalebar 厚度为 {scalebar_thickness} pixels")
-        
-        # 计算比例尺区域的额外高度
-        scalebar_area_height = 0
-        if add_scalebar:
-            # 比例尺区域高度 = 比例尺厚度 + 字体高度 + 间距
-            # 字体高度大约是字体大小的1.2倍（点数转换为像素：1点 = 1/72英寸）
-            font_height_px = (fontsize_pt / 72) * dpi
-            scalebar_area_height = int(scalebar_thickness + font_height_px * 1.5 + height * scalebar_padding)
+            scalebar_thickness = auto_thickness
+        scalebar_area_height = auto_area_height if add_scalebar else 0
+        print(f"标尺布局: 字号 {fontsize_pt}pt / 厚度 {scalebar_thickness}px / 边距区 {scalebar_area_height}px")
         
         # 创建图形，宽度不变，高度增加比例尺区域
         fig_width_inches = width / dpi
@@ -1882,10 +2026,13 @@ def save_color_mix_image(
         # 5. 自动计算比例尺长度
         if add_scalebar and pixel_size != 1.0 and pixel_unit != 'pixel':
             if scalebar_length is None:
-                # 选择最接近图像宽度30%的标准长度
-                possible_lengths = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000]
+                # 最接近图像宽度 30% 的 1/2/5×10^k 整数。
+                # 旧表上限恰为 1000（nm 场景会原样打印 "1000 nm" 而非 1 µm）,
+                # 现在可选到 2000/5000 等，配合 _normalize_scalebar_unit 进位显示
                 target_length = phys_width * 0.3
-                scalebar_length = min(possible_lengths, key=lambda x: abs(x - target_length))
+                scalebar_length = min(
+                    (m * 10.0 ** e for e in range(0, 9) for m in (1.0, 2.0, 5.0)),
+                    key=lambda x: abs(x - target_length))
         
         # 6. 计算比例尺在图像中的像素长度
         if add_scalebar and scalebar_length:
@@ -1894,26 +2041,12 @@ def save_color_mix_image(
         else:
             scalebar_px = 0
         
-        # 7. 计算字体大小（基于图像高度）
-        fontsize_pt = max(height // 50, 8)  # 设置最小字体大小
-        print(f"计算得到 font size 为 {fontsize_pt} pixels")
-        
-        # 8. 计算比例尺厚度
-        if scalebar_thickness is None and add_scalebar:
-            # 基于图像高度和比例尺像素长度计算
-            base_thickness = int(height * 0.02)  # 图像高度的2%
-            if scalebar_px > 0:
-                scalebar_thickness = max(int(scalebar_px * 0.1), base_thickness)
-            else:
-                scalebar_thickness = base_thickness
-            print(f"计算得到 scalebar 厚度为 {scalebar_thickness} pixels")
-        
-        # 9. 计算比例尺区域的额外高度
-        scalebar_area_height = 0
-        if add_scalebar:
-            # 比例尺区域高度 = 比例尺厚度 + 字体高度 + 间距
-            font_height_px = (fontsize_pt / 72) * dpi
-            scalebar_area_height = int(scalebar_thickness + font_height_px * 1.5 + height * scalebar_padding)
+        # 7-9. 字号/厚度/底部边距区：紧凑布局（对齐 Velox 显示，见 _scalebar_layout）
+        fontsize_pt, auto_thickness, auto_area_height = _scalebar_layout(height, scalebar_px, dpi)
+        if scalebar_thickness is None:
+            scalebar_thickness = auto_thickness
+        scalebar_area_height = auto_area_height if add_scalebar else 0
+        print(f"标尺布局: 字号 {fontsize_pt}pt / 厚度 {scalebar_thickness}px / 边距区 {scalebar_area_height}px")
         
         # 10. 创建图形
         fig_width_inches = width / dpi
@@ -2103,21 +2236,21 @@ def add_scalebar_to_axis(
     x_start = x_center - scalebar_px / 2
     x_end = x_center + scalebar_px / 2
     
-    # 根据位置设置y坐标
+    # 像素厚度 → 坐标轴单位。matplotlib 的 ax.bbox.height 本身就是像素值，
+    # 旧式 /(bbox* dpi / 72) 会把条放大约 72 倍占满边距区；
+    # 上一版误再乘 dpi 又会把条压成亚像素细线（不可见），正确换算即除以像素高
+    axis_h_px = max(8.0, float(ax.bbox.height))
+    scalebar_height = float(np.clip(scalebar_thickness / axis_h_px, 0.01, 0.9))
+    pad = 0.06
     if position == 'below':
-        # 比例尺在下方，靠近底部显示
-        y_pos = 0.3
-        text_y = y_pos + 0.1  # 文字在比例尺上方
-        text_va = 'bottom'  # 文字底部对齐
+        # 比例尺条贴近边距区底部，文字在其上方（间隙≈1.5pad，对齐参考实测 27px）
+        y_base = pad
+        text_y = pad + scalebar_height + pad * 1.5
+        text_va = 'bottom'
     else:  # 'above'
-        # 比例尺在上方，靠近底部显示
-        y_pos = 0.3
-        text_y = y_pos + 0.2  # 文字在比例尺下方
-        text_va = 'top'  # 文字顶部对齐
-    
-    # 计算比例尺厚度在坐标轴中的高度
-    # 坐标轴高度为1，我们需要将像素厚度转换为坐标轴单位
-    scalebar_height = scalebar_thickness / (ax.bbox.height * dpi / 72)  # 转换为坐标轴单位
+        y_base = 1.0 - pad - scalebar_height
+        text_y = y_base - pad * 0.6
+        text_va = 'top'
     print(f"实际输出的 scalebar 厚度为 {scalebar_thickness} pixels\n实际输出的 scalebar 长度为 {scalebar_px} pixels")
     # 添加比例尺背景（白色）
     background_rect = Rectangle(
@@ -2134,7 +2267,7 @@ def add_scalebar_to_axis(
 
     # 添加比例尺矩形（黑色）
     scalebar_rect = Rectangle(
-        (x_start, y_pos - scalebar_height/2),
+        (x_start, y_base),
         scalebar_px,
         scalebar_height,
         linewidth=0,
@@ -2145,24 +2278,25 @@ def add_scalebar_to_axis(
     )
     ax.add_patch(scalebar_rect)
     
-    # 获取单位符号
-    unit_symbol = get_unit_symbol(pixel_unit)
-    
+    # 数值进位（1000 nm → 1 µm、5000 nm → 5 µm），仅影响标签，不改变像素长度
+    bar_len, bar_unit = _normalize_scalebar_unit(scalebar_length, pixel_unit)
+    unit_symbol = get_unit_symbol(bar_unit)
+
     # 格式化比例尺文本
-    if scalebar_length < 1:
+    if bar_len < 1:
         # 小数值，保留适当小数位
-        if scalebar_length < 0.01:
-            scalebar_text = f"{scalebar_length:.3f} {unit_symbol}"
-        elif scalebar_length < 0.1:
-            scalebar_text = f"{scalebar_length:.2f} {unit_symbol}"
+        if bar_len < 0.01:
+            scalebar_text = f"{bar_len:.3f} {unit_symbol}"
+        elif bar_len < 0.1:
+            scalebar_text = f"{bar_len:.2f} {unit_symbol}"
         else:
-            scalebar_text = f"{scalebar_length:.1f} {unit_symbol}"
+            scalebar_text = f"{bar_len:.1f} {unit_symbol}"
     else:
         # 整数值，显示整数
-        if scalebar_length == int(scalebar_length):
-            scalebar_text = f"{int(scalebar_length)} {unit_symbol}"
+        if bar_len == int(bar_len):
+            scalebar_text = f"{int(bar_len)} {unit_symbol}"
         else:
-            scalebar_text = f"{scalebar_length:.1f} {unit_symbol}"
+            scalebar_text = f"{bar_len:.1f} {unit_symbol}"
     print(f"实际输出的 font size 为 {fontsize}")
     # 添加比例尺文字（黑色）
     ax.text(
@@ -2256,16 +2390,77 @@ class VeloxFileAnalyzer:
                 print(f"[ERROR] 文件不存在: {file_path}")
         if not hasattr(self, 'f'):
             raise ValueError("[ERROR] 文件无法打开，可能已损坏或被其他软件占用")
-        self.features = bytes_to_json(self.f['Features']['Features'])['features']
-        
+        # 无特征解析发生时（半成品文件）parameters 也须存在，导出层统一按 dict 处理
+        self.parameters = {}
+        if 'Features' in self.f and 'Features' in self.f['Features']:
+            self.features = bytes_to_json(self.f['Features']['Features'])['features']
+        else:
+            # 半成品文件：Velox 采集被中断/拷贝截断时，图像数据已落盘但
+            # /Features 等元数据树尚未写入（实测 20250603 批次）。降级为
+            # 恢复模式：直接导出 /Data/Image 下的原始图像与可解码标定。
+            print('[WARN] 缺少 /Features：文件未写完（Velox 中断产物），'
+                  '进入恢复模式，仅导出 /Data/Image 原始数据')
+            self.features = []
+
         # 初始化各特征路径
         self._init_feature_paths()
-        
-        # 获取实验日志
-        self.get_experiment_log()
-        
+
+        # 获取实验日志（半成品文件可能同样缺少 Experiment 树）
+        if 'Experiment' in self.f:
+            self.get_experiment_log()
+
         # 根据检测到的特征类型执行相应的数据提取
         self._extract_data_based_on_features()
+
+        # 恢复模式：无特征树时抢救原始图像
+        if not self.features:
+            self._recover_partial_images()
+
+    def _recover_partial_images(self):
+        """半成品文件恢复：遍历 /Data/Image/*，尽力导出像素数据与 Metadata 标定。
+
+        产出 self.recovered_images = [{'data', 'pixelsize', 'pixelunit',
+        'image_name', 'display_range', 'gamma', 'display_index'}, ...]，
+        由 GUI/CLI 导出层以 "{源文件名}-Recovered[-ii]" 命名写出。
+        """
+        self.recovered_images = []
+        data_root = self.f.get('Data')
+        if data_root is None or 'Image' not in data_root:
+            print('[RECOVER] 未发现 /Data/Image，无可恢复数据')
+            return
+        stem = Path(self.file_path).stem
+        nodes = sorted(data_root['Image'].keys())
+        img_nodes = [u for u in nodes if 'Data' in data_root['Image'][u]]
+        multi = len(img_nodes) > 1
+        for idx, uid in enumerate(img_nodes, 1):
+            node = data_root['Image'][uid]
+            try:
+                data = optimized_read_with_progress(
+                    self.file_path, f'Data/Image/{uid}/Data', h5file=self.f)
+            except Exception as e:
+                print(f'[RECOVER] 数据块 {uid} 读取失败，跳过: {e}')
+                continue
+            pixelsize, pixelunit = 1.0, 'px'
+            try:
+                meta = decode_metadata(node['Metadata'])
+                pixelsize, pixelunit = self._get_pixel_size(meta)
+            except Exception:
+                pass  # 标定缺失时按 px 导出
+            try:
+                lo, hi = np.percentile(data, (0.5, 99.5))
+            except Exception:
+                lo, hi = 0, 1
+            name = f"{stem}-Recovered-{idx:02d}" if multi else f"{stem}-Recovered"
+            self.recovered_images.append({
+                'data': data,
+                'pixelsize': float(pixelsize),
+                'pixelunit': str(pixelunit),
+                'image_name': name,
+                'display_range': [float(lo), float(hi)],
+                'gamma': 1.0,
+                'display_index': 0,
+            })
+        print(f'[RECOVER] 文件未写完，已按原始数据恢复 {len(self.recovered_images)} 个图像数据集')
     
     def _init_feature_paths(self):
         """初始化所有可能存在的特征路径。"""
@@ -2459,11 +2654,12 @@ class VeloxFileAnalyzer:
             'display_range': [
                 float(item) for item in image_display['displayLevelsRange'].values()
             ],
-            'gamma': float(image_display['gamma'])
+            'gamma': float(image_display['gamma']),
+            'display_angle': _display_angle(image_display),
         }
         self._update_parameters(parameters)
         return self
-    
+
     # ========================================================================
     # DCFI 图像处理
     # ========================================================================
@@ -2484,6 +2680,7 @@ class VeloxFileAnalyzer:
         )
         self.dcfi_data = dcfi_data
         image_metadata = decode_metadata(self.get_path(dcfi_data_path+'/Metadata'))
+        self.dcfi_metadata = image_metadata  # export_dcfi_image 的 DM5 分支依赖此属性
         # 提取显示参数
         parameters = {}
         parameters['DCFI'] = {
@@ -2494,7 +2691,8 @@ class VeloxFileAnalyzer:
             'display_range': [
                 float(item) for item in dcfi_display['displayLevelsRange'].values()
             ],
-            'gamma': float(dcfi_display['gamma'])
+            'gamma': float(dcfi_display['gamma']),
+            'display_angle': _display_angle(dcfi_display),
         }
         self._update_parameters(parameters)
         return self
@@ -3096,10 +3294,17 @@ class VeloxFileAnalyzer:
         if not hasattr(self, 'crop_feature_path'):
             print('[ERROR] 没有裁剪图像')
             return self
-        
+
         crop_feature = self.get_path(self.crop_feature_path)
+        if 'imageDisplay' not in crop_feature:
+            # 部分 Velox 记录存在"空裁剪"：CropFeature 只有 cropOperationPath/
+            # cropAnnotationPath/inputSize(0,0)，没有 imageDisplay 与裁剪结果数据
+            # （20260203-lyx 批次实测）。跳过该特征而非让整个文件解析失败。
+            print('[WARN] CropFeature 无 imageDisplay（空/未执行的裁剪记录），跳过裁剪图像解析')
+            return self
+
         crop_image_display = self.get_path(crop_feature['imageDisplay'])
-        
+
         series_index = int(crop_image_display['seriesIndex'])
         data_obj = self.get_path(crop_image_display['dataPath'])
         
@@ -3118,6 +3323,7 @@ class VeloxFileAnalyzer:
                 float(num) for num in crop_image_display['displayLevelsRange'].values()
             ],
             'gamma': float(crop_image_display['gamma']),
+            'display_angle': _display_angle(crop_image_display),
             'annotation_shape': crop_annotation_data,
             'annotation_color': crop_annotation['color'],
         }
@@ -3160,6 +3366,7 @@ class VeloxFileAnalyzer:
                 float(num) for num in filtered_image_display['displayLevelsRange'].values()
             ],
             'gamma': float(filtered_image_display['gamma']),
+            'display_angle': _display_angle(filtered_image_display),
             'filter_settings': filter_settings,
             'filter_type': filter_type,
         }
@@ -3208,7 +3415,7 @@ class VeloxFileAnalyzer:
         """先一张一张展示，后续改为统一展示"""
         fig, ax = draw_line_annotation_on_image(self.color_mix_image, line_info=self.line_position, pixel_size=self.parameters['pixelsize'], pixel_unit=self.parameters['pixelunit'])
         plt.show()
-        fig = draw_line_profiles(self.line_profile_data, pixel_size=self.parameters['pixelsize'], pixel_unit=self.parameters['pixelunit'])
+        fig = draw_line_profiles(self.line_profile_data, pixel_size=self.parameters['pixelsize'], pixel_unit=self.parameters['pixelunit'], quantification_mode=self.parameters.get('quantification_mode', ''))
         plt.show()
     
     def display_tem_image(self):
@@ -3246,6 +3453,9 @@ class VeloxFileAnalyzer:
     def display_crop_image(self):
         """先一张一张展示，后续改为统一展示"""
         key = 'crop'
+        if key not in self.parameters or not hasattr(self, 'crop_data'):
+            print('[WARN] 无已解析的裁剪图像（可能是空裁剪记录），跳过展示')
+            return
         value = self.parameters[key]
         fig, axe = display_image_with_scale(image = self.crop_data, pixel_size = value['pixelsize'], pixel_unit = value['pixelunit'], title = value['image_name'], cmap = 'gray', display_range = value['display_range'], gamma = value['gamma'], display_index = value['display_index'])
         plt.show()
@@ -3373,7 +3583,7 @@ class VeloxFileAnalyzer:
                 )
         return self
             
-    def export_integrated_spectra(self):
+    def export_integrated_spectra(self, export_type=''):
         """
         将 eds spectra 导出
         导出为 csv 文件
@@ -3389,7 +3599,7 @@ class VeloxFileAnalyzer:
         export_eds_spectrum(output_path=output_path, intensity=self.spectra_data['total'], offset=self.parameters['OffsetEnergy'], channels=4096, dispension=5)
         return self
     
-    def export_color_mix_and_line_profile(self):
+    def export_color_mix_and_line_profile(self, export_type=''):
         # 如果一个文件只有 color mix，没有 line profile 怎么导出？
         # draw_line_annotation_on_image 这个函数不传递 line_info 就可以画出没有 line annotation 的 color mix
         # 如果想要选择不同的元素分布图，做出不同的 color mix 该怎么做？
@@ -3419,13 +3629,13 @@ class VeloxFileAnalyzer:
 
             filename = f"{filename_stem}-Colormix-LineProfile.png"
             output_path = self.export_dir / filename
-            fig = draw_line_profiles(self.line_profile_data, output_path = output_path, pixel_size=self.parameters['pixelsize'], pixel_unit=self.parameters['pixelunit'])
+            fig = draw_line_profiles(self.line_profile_data, output_path = output_path, pixel_size=self.parameters['pixelsize'], pixel_unit=self.parameters['pixelunit'], quantification_mode=quantification_mode)
         if '1' in export_option or '2' in export_option:
             filename = f"{filename_stem}-Colormix-LineProfile.csv"
             output_path = self.export_dir / filename
             export_line_profile_as_csv(output_path, line_length_pixel=self.line_position['length'], line_profile=self.line_profile_data, pixelsize=self.parameters['pixelsize'], pixelunit=self.parameters['pixelunit'], quantification_mode=quantification_mode)
     
-    def export_tem_image(self):
+    def export_tem_image(self, export_type=''):
         """
         将 TEM 图像导出
         导出为 16bit TIFF (data) 和/或 png (with scale bar)
@@ -3434,13 +3644,17 @@ class VeloxFileAnalyzer:
         filename_stem = Path(self.file_path).stem
         # 确保输出路径存在 r".\custom_export\{origin_filename_stem}\"
         self.check_output_dir()
+        data = self.tem_data
+        # Velox 显示时按 ImageDisplay.angle（弧度）旋转，存储数组未旋转；自动恢复
+        data = apply_view_rotation(data,
+                                   angle_deg=self.parameters['Ceta'].get('display_angle', 0.0))
         if '1' in export_option or '2' in export_option:
             filename = f"{filename_stem}.dm5"
             output_path = self.export_dir / filename
             signal = {}
-            signal['data'] = self.tem_data
-            if self.tem_data.ndim == 2:
-                signal['data'] = self.tem_data[..., np.newaxis]
+            signal['data'] = data
+            if data.ndim == 2:
+                signal['data'] = data[..., np.newaxis]
             signal['metadata'] = self.tem_metadata
             signal['color'] = {'blue': 1, 'green': 1, 'red': 1}
             signal['display_range'] = self.parameters['Ceta']['display_range']
@@ -3450,7 +3664,6 @@ class VeloxFileAnalyzer:
             output_path = self.export_dir / filename
             imagej_metadata = {}
             imagej_metadata['ImageJ'] = '1.54g'
-            data = self.tem_data
             if data.ndim == 3:
                 imagej_metadata['slices'] = data.shape[-1] # (height, width, slices)？
             imagej_metadata['unit'] = self.parameters['Ceta']['pixelunit'].replace('μ', 'u') # 替换非ASCII字符
@@ -3460,10 +3673,10 @@ class VeloxFileAnalyzer:
             filename = f"{filename_stem}.png"
             output_path = self.export_dir / filename
             parameters = self.parameters['Ceta']
-            if self.tem_data.ndim == 2:
+            if data.ndim == 2:
                 # 如果是单张图像
                 success = save_image_as_png(
-                    image=self.tem_data,
+                    image=data,
                     output_path=output_path,
                     pixel_size=parameters['pixelsize'],
                     pixel_unit=parameters['pixelunit'],
@@ -3473,9 +3686,9 @@ class VeloxFileAnalyzer:
                     # display_index=parameters['display_index'],
                     add_scalebar=True
                 )
-            elif self.tem_data.ndim == 3:
+            elif data.ndim == 3:
                 success = save_image_as_png(
-                    image=self.tem_data,
+                    image=data,
                     output_path=output_path,
                     pixel_size=parameters['pixelsize'],
                     pixel_unit=parameters['pixelunit'],
@@ -3486,27 +3699,35 @@ class VeloxFileAnalyzer:
                     add_scalebar=True
                 )
             else:
-                print(f"tem_data 的 shape 有问题，需要检查\nself.tem_data.shape: {self.tem_data.shape}")
+                print(f"tem_data 的 shape 有问题，需要检查\ndata.shape: {data.shape}")
         return self
     
-    def export_dcfi_image(self):
+    def export_dcfi_image(self, export_type=''):
         """
         将 DCFI 图像导出
         导出为 16bit TIFF (data) 和/或 png (with scale bar)
         """
-        export_option = input("""DFCI图像导出格式（可以输入单独的数字或者组合）：\n  1. All\n  2. Data (DM5)\n  3. Data (16-bit TIFF)\n  4. Image (PNG)\n""").strip()
+        export_option = input("""DFCI图像导出格式（可以输入单独的数字或者组合）：\n  1. All\n  2. Data (DM5)\n  3. Data (16-bit TIFF)\n  4. Image (PNG)\n  5. Data 仅导出最后一帧（积分图，可与 1-4 组合）\n""").strip()
         # filename_stem = Path(self.file_path).stem
         assert 'DCFI' in self.parameters.keys()
         filename_stem = self.parameters['DCFI']['image_name']
         # 确保输出路径存在 r".\custom_export\{origin_filename_stem}\"
         self.check_output_dir()
+        data = self.dcfi_data
+        if '5' in export_option and data.ndim == 3 and data.shape[-1] > 1:
+            # dcfi_data 的每一帧都是"截至第 k 帧的累积积分图"，
+            # 最后一帧即漂移校正后全部叠加得到的积分图像
+            data = data[:, :, -1]
+        # Velox 显示时按 ImageDisplay.angle（弧度）旋转，存储数组未旋转；自动恢复
+        data = apply_view_rotation(data,
+                                   angle_deg=self.parameters['DCFI'].get('display_angle', 0.0))
         if '1' in export_option or '2' in export_option:
             filename = f"{filename_stem}.dm5"
             output_path = self.export_dir / filename
             signal = {}
-            signal['data'] = self.dcfi_data
-            if self.dcfi_data.ndim == 2:
-                signal['data'] = self.dcfi_data[..., np.newaxis]
+            signal['data'] = data
+            if data.ndim == 2:
+                signal['data'] = data[..., np.newaxis]
             signal['metadata'] = self.dcfi_metadata
             signal['color'] = {'blue': 1, 'green': 1, 'red': 1}
             signal['display_range'] = self.parameters['DCFI']['display_range']
@@ -3516,7 +3737,6 @@ class VeloxFileAnalyzer:
             output_path = self.export_dir / filename
             imagej_metadata = {}
             imagej_metadata['ImageJ'] = '1.54g'
-            data = self.dcfi_data
             if data.ndim == 3:
                 imagej_metadata['slices'] = data.shape[-1] # (height, width, slices)？
             imagej_metadata['unit'] = self.parameters['DCFI']['pixelunit'].replace('μ', 'u') # 替换非ASCII字符
@@ -3526,10 +3746,10 @@ class VeloxFileAnalyzer:
             filename = f"{filename_stem}.png"
             output_path = self.export_dir / filename
             parameters = self.parameters['DCFI']
-            if self.dcfi_data.ndim == 2:
+            if data.ndim == 2:
                 # 如果是单张图像
                 success = save_image_as_png(
-                    image=self.dcfi_data,
+                    image=data,
                     output_path=output_path,
                     pixel_size=parameters['pixelsize'],
                     pixel_unit=parameters['pixelunit'],
@@ -3539,9 +3759,9 @@ class VeloxFileAnalyzer:
                     # display_index=parameters['display_index'],
                     add_scalebar=True
                 )
-            elif self.dcfi_data.ndim == 3:
+            elif data.ndim == 3:
                 success = save_image_as_png(
-                    image=self.dcfi_data,
+                    image=data,
                     output_path=output_path,
                     pixel_size=parameters['pixelsize'],
                     pixel_unit=parameters['pixelunit'],
@@ -3552,10 +3772,10 @@ class VeloxFileAnalyzer:
                     add_scalebar=True
                 )
             else:
-                print(f"dcfi_data 的 shape 有问题，需要检查\nself.dcfi_data.shape: {self.dcfi_data.shape}")
+                print(f"dcfi_data 的 shape 有问题，需要检查\ndata.shape: {data.shape}")
         return self
     
-    def export_stem_image(self):
+    def export_stem_image(self, export_type=''):
         """
         将 STEM 图像导出
         导出为 16bit TIFF (data) 和/或 png (with scale bar)
@@ -3625,7 +3845,7 @@ class VeloxFileAnalyzer:
                     print(f"stem_data 的 shape 有问题，需要检查\nself.stem_data[{key}].shape: {data.shape}")
         return self
     
-    def export_dpc_images(self):
+    def export_dpc_images(self, export_type=''):
         """
         将 DPC 图像导出
         导出为 16bit TIFF (data) 和/或 png (with scale bar)
@@ -3695,24 +3915,30 @@ class VeloxFileAnalyzer:
                     print(f"dpc_data 的 shape 有问题，需要检查\nself.dpc_data[{key}].shape: {data.shape}")
         return self
     
-    def export_crop_image(self):
+    def export_crop_image(self, export_type=''):
         """
         将 crop 图像导出
         导出为 16bit TIFF (data) 和/或 png (with scale bar)
         """
+        if 'crop' not in self.parameters.keys() or not hasattr(self, 'crop_data'):
+            print('[WARN] 无已解析的裁剪图像（可能是空裁剪记录），跳过导出')
+            return self
         export_option = input("""crop图像导出格式（可以输入单独的数字或者组合）：\n  1. All\n  2. Data (DM5)\n  3. Data (16-bit TIFF)\n  4. Image (PNG)\n""").strip()
         # filename_stem = Path(self.file_path).stem
-        assert 'crop' in self.parameters.keys()
         filename_stem = self.parameters['crop']['image_name']
         # 确保输出路径存在 r".\custom_export\{origin_filename_stem}\"
         self.check_output_dir()
+        data = self.crop_data
+        # 裁剪图同样源自 Ceta 相机数据，自动恢复显示方向
+        data = apply_view_rotation(data,
+                                   angle_deg=self.parameters['crop'].get('display_angle', 0.0))
         if '1' in export_option or '2' in export_option:
             filename = f"{filename_stem}.dm5"
             output_path = self.export_dir / filename
             signal = {}
-            signal['data'] = self.crop_data
-            if self.crop_data.ndim == 2:
-                signal['data'] = self.crop_data[..., np.newaxis]
+            signal['data'] = data
+            if data.ndim == 2:
+                signal['data'] = data[..., np.newaxis]
             signal['metadata'] = self.crop_metadata
             signal['color'] = {'blue': 1, 'green': 1, 'red': 1}
             signal['display_range'] = self.parameters['crop']['display_range']
@@ -3722,7 +3948,6 @@ class VeloxFileAnalyzer:
             output_path = self.export_dir / filename
             imagej_metadata = {}
             imagej_metadata['ImageJ'] = '1.54g'
-            data = self.crop_data
             if data.ndim == 3:
                 imagej_metadata['slices'] = data.shape[-1] # (height, width, slices)？
             imagej_metadata['unit'] = self.parameters['crop']['pixelunit'].replace('μ', 'u') # 替换非ASCII字符
@@ -3732,10 +3957,10 @@ class VeloxFileAnalyzer:
             filename = f"{filename_stem}.png"
             output_path = self.export_dir / filename
             parameters = self.parameters['crop']
-            if self.crop_data.ndim == 2:
+            if data.ndim == 2:
                 # 如果是单张图像
                 success = save_image_as_png(
-                    image=self.crop_data,
+                    image=data,
                     output_path=output_path,
                     pixel_size=parameters['pixelsize'],
                     pixel_unit=parameters['pixelunit'],
@@ -3745,9 +3970,9 @@ class VeloxFileAnalyzer:
                     # display_index=parameters['display_index'],
                     add_scalebar=True
                 )
-            elif self.crop_data.ndim == 3:
+            elif data.ndim == 3:
                 success = save_image_as_png(
-                    image=self.crop_data,
+                    image=data,
                     output_path=output_path,
                     pixel_size=parameters['pixelsize'],
                     pixel_unit=parameters['pixelunit'],
@@ -3758,10 +3983,10 @@ class VeloxFileAnalyzer:
                     add_scalebar=True
                 )
             else:
-                print(f"crop_data 的 shape 有问题，需要检查\nself.crop_data.shape: {self.crop_data.shape}")
+                print(f"crop_data 的 shape 有问题，需要检查\ndata.shape: {data.shape}")
         return self
     
-    def export_filtered_image(self):
+    def export_filtered_image(self, export_type=''):
         """
         将 filter 图像导出
         导出为 16bit TIFF (data) 和/或 png (with scale bar)
@@ -3772,13 +3997,17 @@ class VeloxFileAnalyzer:
         filename_stem = self.parameters['filter']['image_name']
         # 确保输出路径存在 r".\custom_export\{origin_filename_stem}\"
         self.check_output_dir()
+        data = self.filter_data
+        # 滤波图同样源自 Ceta 相机数据，自动恢复显示方向
+        data = apply_view_rotation(data,
+                                   angle_deg=self.parameters['filter'].get('display_angle', 0.0))
         if '1' in export_option or '2' in export_option:
             filename = f"{filename_stem}.dm5"
             output_path = self.export_dir / filename
             signal = {}
-            signal['data'] = self.filter_data
-            if self.filter_data.ndim == 2:
-                signal['data'] = self.filter_data[..., np.newaxis]
+            signal['data'] = data
+            if data.ndim == 2:
+                signal['data'] = data[..., np.newaxis]
             signal['metadata'] = self.filter_metadata
             signal['color'] = {'blue': 1, 'green': 1, 'red': 1}
             signal['display_range'] = self.parameters['filter']['display_range']
@@ -3788,7 +4017,6 @@ class VeloxFileAnalyzer:
             output_path = self.export_dir / filename
             imagej_metadata = {}
             imagej_metadata['ImageJ'] = '1.54g'
-            data = self.filter_data
             if data.ndim == 3:
                 imagej_metadata['slices'] = data.shape[-1] # (height, width, slices)？
             imagej_metadata['unit'] = self.parameters['filter']['pixelunit'].replace('μ', 'u') # 替换非ASCII字符
@@ -3798,10 +4026,10 @@ class VeloxFileAnalyzer:
             filename = f"{filename_stem}.png"
             output_path = self.export_dir / filename
             parameters = self.parameters['filter']
-            if self.filter_data.ndim == 2:
+            if data.ndim == 2:
                 # 如果是单张图像
                 success = save_image_as_png(
-                    image=self.filter_data,
+                    image=data,
                     output_path=output_path,
                     pixel_size=parameters['pixelsize'],
                     pixel_unit=parameters['pixelunit'],
@@ -3811,9 +4039,9 @@ class VeloxFileAnalyzer:
                     # display_index=parameters['display_index'],
                     add_scalebar=True
                 )
-            elif self.filter_data.ndim == 3:
+            elif data.ndim == 3:
                 success = save_image_as_png(
-                    image=self.filter_data,
+                    image=data,
                     output_path=output_path,
                     pixel_size=parameters['pixelsize'],
                     pixel_unit=parameters['pixelunit'],

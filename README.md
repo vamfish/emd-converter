@@ -5,6 +5,7 @@ FEI Velox EMD 文件批量转换工具，支持导出为 DM5、TIFF、PNG 和 CS
 ## 功能特性
 
 - **批量处理**: 自动处理文件夹中的所有 EMD 文件
+- **拖放添加**: 直接把 EMD 文件或文件夹拖入窗口（基于 tkinterdnd2，未安装时自动降级为按钮方式）
 - **多格式导出**: 支持 DM5、TIFF (16-bit)、PNG、CSV 格式
 - **数据类型支持**: STEM、TEM、EDS Mapping / Line Scan、DPC、DCFI、SAD 衍射图 等
 - **元数据保留**: 保留像素尺寸、单位、显示范围、Gamma 等校准信息
@@ -72,8 +73,8 @@ python emd_converter_gui.py
 
 ### 2. 使用步骤
 
-1. 点击"选择文件夹"（或"添加文件"）按钮，选择包含 EMD 文件的文件夹
-2. 勾选需要导出的格式 (DM5、TIFF、PNG、CSV)；EDS 数据可展开 EDS 选项
+1. 点击"选择文件夹"（或"添加文件"）按钮，选择包含 EMD 文件的文件夹；也可直接把文件/文件夹拖放到窗口上
+2. 勾选需要导出的格式 (DM5、TIFF、PNG、CSV)；EDS 数据可展开 EDS 选项；DCFI 数据默认仅导出最后一帧（积分图），可取消勾选恢复整栈导出
 3. 点击"开始处理"
 4. 转换后的文件将保存在输出目录的子文件夹中（默认 `custom_export/{源文件名}/`）
 
@@ -93,12 +94,12 @@ python emd_converter_gui.py
 
 ## 支持的 EMD 数据类型
 
-- **STEM / TEM 图像**（单张与系列）: 导出为 DM5、TIFF、PNG
+- **STEM / TEM 图像**（单张与系列）: 导出为 DM5、TIFF、PNG。Ceta 相机系图像（TEM/DCFI/裁剪/滤波）自动恢复 Velox 屏幕方向（按 ImageDisplay 显示角度旋转并裁内接方形；该字段为弧度，即 Velox "Image Rotation" 面板读数换算）；显示角度为 0 的文件与 STEM/EDS 等恒等直通，无需设置
 - **EDS Mapping**（元素分布图）: 导出为 DM5、TIFF、PNG
 - **EDS 能谱**（积分谱图）: 导出为 CSV、PNG 谱图
 - **EDS Line Scan**: ColorMix 图像、Line Profile PNG 与 CSV
 - **DPC（差分相位衬度）**: 导出为 DM5、TIFF、PNG
-- **DCFI（漂移校正帧积分）**: 导出为 DM5、TIFF、PNG
+- **DCFI（漂移校正帧积分）**: 导出为 DM5、TIFF、PNG。DCFI 数据栈的每一帧均为"截至该帧的累积积分图"，默认仅导出最后一帧（全部叠加后的积分图像）；原始逐帧数据由 TEM/STEM 分支导出。取消勾选"仅导出最后一帧"可恢复导出整个累积序列
 - **SAD 衍射图**: 导出为 DM5、TIFF、PNG（比例尺正确标注 1/nm 倒数空间单位）
 
 ## 输出文件命名规则
@@ -113,6 +114,7 @@ python emd_converter_gui.py
 - TIFF 导出使用 16-bit 格式以保留完整动态范围
 - 像素尺寸、单位等校准信息会保留在 TIFF 和 DM5 文件的元数据中
 - 大文件（数 GB 级原位序列）处理需要较多内存；低内存机器会自动切换流式模式并给出提示
+- Velox 写中断产生的"半成品"文件（缺 /Features）会以 `-Recovered` 命名尽力抢救 `/Data/Image` 中的原始图像；恢复结果缺显示旋转/窗口布局信息，属预期
 - 勾选"并行处理"可加速多文件批次（默认关闭；大文件按内存预算自动独占串行）
 - 配置文件 `gui_config.json` 会自动保存用户设置
 
@@ -132,6 +134,9 @@ python emd_converter_gui.py
 - matplotlib >= 3.3.0
 - beautifulsoup4 >= 4.9.0
 - tqdm >= 4.60.0
+
+可选依赖：
+- tkinterdnd2 >= 0.4.0（GUI 拖放添加文件/文件夹；缺失时功能自动降级，不影响其余功能）
 
 ## 许可证
 

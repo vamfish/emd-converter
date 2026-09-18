@@ -66,6 +66,7 @@ jobs:
             --name $exeName `
             --collect-all h5py `
             --collect-all tifffile `
+            --collect-all tkinterdnd2 `
             emd_converter_gui.py
 
       - name: List artifact

@@ -80,15 +80,17 @@ def make_image(f: h5py.File, data_path: str, arr: np.ndarray,
 def make_display(f: h5py.File, data_path: str, label: str = 'Img',
                  series_index: int = 0, gamma: str = '1',
                  begin: str = '0', end: str = '1000',
-                 disp_id: str = 'a', extra: Optional[dict] = None) -> str:
-    """写入 ImageDisplay object JSON，返回其路径。"""
+                 disp_id: str = 'a', extra: Optional[dict] = None,
+                 angle: float = 0.0) -> str:
+    """写入 ImageDisplay object JSON，返回其路径。angle 为显示旋转角（度）。"""
     path = f'/Presentation/Displays/ImageDisplay/{_uid()}'
     obj = {
         'display': {'id': disp_id, 'label': label, 'overlays': '',
                     'priority': '1', 'closable': 'false', 'visible': 'true'},
         'dataPath': data_path,
         'seriesIndex': str(series_index),
-        'zoom': '1', 'pan': {'x': '0', 'y': '0'}, 'angle': '0', 'offsetAngle': '0',
+        'angle': str(angle), 'offsetAngle': '0',
+        'zoom': '1', 'pan': {'x': '0', 'y': '0'},
         'cropMode': 'PowerOf2', 'autoDisplayLevels': 'true', 'autoWhiteMode': 'false',
         'displayLevelsRange': {'begin': begin, 'end': end},
         'invertColors': 'false', 'gamma': gamma, 'vibrant': 'false',
@@ -117,13 +119,14 @@ def default_image(shape: Tuple[int, int], frames: int = 1, dtype=None) -> np.nda
 # 特征构造器（每个返回注册到 Features 的 dict）
 # --------------------------------------------------------------------------
 
-def add_camera(f: h5py.File, shape: Tuple[int, int], frames: int = 1) -> dict:
-    """TEM / CameraFeature（单张与系列共用，frames 区分）。"""
+def add_camera(f: h5py.File, shape: Tuple[int, int], frames: int = 1,
+               angle: float = 0.0) -> dict:
+    """TEM / CameraFeature（单张与系列共用，frames 区分；angle=显示旋转角）。"""
     data_path = f'/Data/Image/{_uid()}'
     make_image(f, data_path, default_image(shape, frames), make_metadata(detector='Ceta', frames=frames))
     feat_path = f'/Features/CameraFeature/{_uid()}'
     op_path = f'/Operations/CameraInputOperation/{_uid()}'
-    disp_path = make_display(f, data_path, label='Ceta')
+    disp_path = make_display(f, data_path, label='Ceta', angle=angle)
     put_json(f, feat_path, {
         'cameraInputOperation': op_path,
         'imageDisplay': disp_path,
@@ -182,7 +185,8 @@ def add_dpc(f: h5py.File, shape: Tuple[int, int], segments: Sequence[str],
     return {'DPCFeature': feat_path}
 
 
-def add_dcfi(f: h5py.File, shape: Tuple[int, int], frames: int = 1) -> dict:
+def add_dcfi(f: h5py.File, shape: Tuple[int, int], frames: int = 1,
+             angle: float = 0.0) -> dict:
     """DcfiFeature：imageDisplay 指向经过漂移校正的数据。"""
     data_path = f'/Data/Image/{_uid()}'
     make_image(f, data_path, default_image(shape, frames), make_metadata(detector='Ceta', frames=frames))
@@ -190,7 +194,7 @@ def add_dcfi(f: h5py.File, shape: Tuple[int, int], frames: int = 1) -> dict:
     shp = f'/Operations/ShiftMeasurementOperation/{_uid()}'
     integ = f'/Operations/IntegrationOperation/{_uid()}'
     dlo = f'/Operations/DisplayLevelsOperation/{_uid()}'
-    disp_path = make_display(f, data_path, label='DCFI(Ceta)')
+    disp_path = make_display(f, data_path, label='DCFI(Ceta)', angle=angle)
     put_json(f, shp, {})
     put_json(f, integ, {})
     put_json(f, dlo, {})
@@ -203,8 +207,11 @@ def add_dcfi(f: h5py.File, shape: Tuple[int, int], frames: int = 1) -> dict:
     return {'DcfiFeature': feat_path}
 
 
-def add_crop(f: h5py.File, shape: Tuple[int, int], frames: int = 1) -> dict:
-    """CropFeature：裁剪图像 + 标注形状。"""
+def add_crop(f: h5py.File, shape: Tuple[int, int], frames: int = 1,
+             angle: float = 0.0, with_display: bool = True) -> dict:
+    """CropFeature：裁剪图像 + 标注形状。with_display=False 复现
+    真实"空裁剪"记录（仅 cropOperationPath/cropAnnotationPath/inputSize，
+    无 imageDisplay；见 20260203-lyx 批次）。"""
     data_path = f'/Data/Image/{_uid()}'
     make_image(f, data_path, default_image(shape, frames), make_metadata(detector='Ceta', frames=frames))
     feat_path = f'/Features/CropFeature/{_uid()}'
@@ -215,18 +222,20 @@ def add_crop(f: h5py.File, shape: Tuple[int, int], frames: int = 1) -> dict:
     put_json(f, shape_path, {'shape': 'rectangle', 'x': 0, 'y': 0, 'w': 8, 'h': 8})
     put_json(f, ann, {'dataPath': shape_path,
                       'color': {'red': '1', 'green': '0', 'blue': '0'}})
-    disp_path = make_display(f, data_path, label='Crop#1')
-    put_json(f, feat_path, {
-        'imageDisplay': disp_path,
+    feat = {
         'cropOperationPath': crop_op,
         'cropAnnotationPath': ann,
         'inputSize': {'width': '0', 'height': '0'},
-    })
+    }
+    if with_display:
+        feat['imageDisplay'] = make_display(f, data_path, label='Crop#1', angle=angle)
+    put_json(f, feat_path, feat)
     put_json(f, crop_op, {})
     return {'CropFeature': feat_path}
 
 
-def add_filter(f: h5py.File, shape: Tuple[int, int], frames: int = 1) -> dict:
+def add_filter(f: h5py.File, shape: Tuple[int, int], frames: int = 1,
+               angle: float = 0.0) -> dict:
     """ImageFilteringFeature：滤波图像 + 滤波设置。"""
     data_path = f'/Data/Image/{_uid()}'
     make_image(f, data_path, default_image(shape, frames), make_metadata(detector='Ceta', frames=frames))
@@ -234,7 +243,7 @@ def add_filter(f: h5py.File, shape: Tuple[int, int], frames: int = 1) -> dict:
     record = f'/Operations/ImageFilteringOperation/{_uid()}'
     settings = f'/SharedProperties/ImageFilteringSettings/{_uid()}'
     put_json(f, settings, {'mode': 'median', 'size': '3'})
-    disp_path = make_display(f, data_path, label='Filtered#1')
+    disp_path = make_display(f, data_path, label='Filtered#1', angle=angle)
     put_json(f, record, {'settingsPath': settings, 'filterType': 'MedianFilter'})
     put_json(f, feat_path, {
         'imageDisplay': disp_path,
@@ -399,22 +408,37 @@ def add_colormix(f: h5py.File, shape: Tuple[int, int]) -> dict:
     return {'ColorMixProfileFeature': feat_path}
 
 
-def build_emd(path, features=('camera',), shape=(16, 16), frames=1):
+def build_partial_emd(path, shape: Tuple[int, int] = (8, 8), frames: int = 1):
+    """复现"半成品"文件：Velox 写中断产物——只有 /Data/Image，
+    无 /Features、/Experiment、/Info、/Version（如 20250603 批次）。"""
+    if isinstance(path, str):
+        path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with h5py.File(path, 'w') as f:
+        data_path = f'/Data/Image/{_uid()}'
+        make_image(f, data_path, default_image(shape, frames),
+                   make_metadata(detector='Ceta', frames=frames))
+    return path
+
+
+def build_emd(path, features=('camera',), shape=(16, 16), frames=1, angle=0.0):
     """构造最小 EMD 文件。
 
     features: 'camera'|'stem'|'dpc'|'dcfi'|'crop'|'filter'|'si'|'integrated'
               （'colormix' 需与 'si' 组合）
+    angle: Ceta 系特征（camera/dcfi/crop/filter）的 ImageDisplay 显示旋转角（度）
     """
     if isinstance(path, str):
         path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     charters = {
-        'camera': lambda f: add_camera(f, shape, frames),
+        'camera': lambda f: add_camera(f, shape, frames, angle=angle),
         'stem': lambda f: add_stem(f, shape, frames),
         'dpc': lambda f: add_dpc(f, shape, ('HAADF', 'DF', 'iDPC')),
-        'dcfi': lambda f: add_dcfi(f, shape, frames),
-        'crop': lambda f: add_crop(f, shape, frames),
-        'filter': lambda f: add_filter(f, shape, frames),
+        'dcfi': lambda f: add_dcfi(f, shape, frames, angle=angle),
+        'crop': lambda f: add_crop(f, shape, frames, angle=angle),
+        'crop_empty': lambda f: add_crop(f, shape, frames, with_display=False),
+        'filter': lambda f: add_filter(f, shape, frames, angle=angle),
         'integrated': lambda f: add_integrated_spectra(f),
         'si': lambda f: add_si(f, shape),
         'colormix': lambda f: add_colormix(f, shape),

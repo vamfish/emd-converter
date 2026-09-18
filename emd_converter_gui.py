@@ -4,11 +4,13 @@ EMD 文件批量转换工具 - GUI 版本
 """
 
 import os
+import re
 import sys
 import json
 import threading
 from pathlib import Path
 from datetime import datetime
+from urllib.parse import unquote, urlparse
 from tkinter import (
     Tk, Frame, Label, Button, Entry, Checkbutton, 
     Listbox, Scrollbar, StringVar, BooleanVar, 
@@ -28,6 +30,61 @@ from velox_file_analyzer2 import VeloxFileAnalyzer
 
 # 配置文件路径
 CONFIG_FILE = Path(__file__).parent / "gui_config.json"
+
+
+def parse_drop_paths(raw: str) -> list:
+    r"""解析 tkdnd 投递字符串 → 路径列表。
+
+    支持三种形式并可混排：
+    - Windows 花括号含空格路径: ``{D:/a b/x.emd} {D:/y.emd}``
+    - 空格分隔普通路径: ``/tmp/a.emd /tmp/b.emd``
+    - file:// URI（百分号编码）: ``file:///D:/x/a.emd`` → ``D:/x/a.emd``
+    """
+    if not raw:
+        return []
+    tokens = re.findall(r'\{[^{}]*\}|file://[^\s{}]+|\S+', raw.strip())
+    out = []
+    for tok in tokens:
+        if tok.startswith('{') and tok.endswith('}'):
+            out.append(tok[1:-1])
+        elif tok.startswith('file://'):
+            p = urlparse(tok)
+            path = unquote(p.path or '')
+            if p.netloc and p.netloc.lower() != 'localhost':
+                path = f"//{p.netloc}{path}"
+            if len(path) > 2 and path[0] == '/' and path[2] == ':':
+                path = path[1:]  # Windows 形态 file:///D:/x → /D:/x 去头斜杠
+            out.append(path)
+        else:
+            out.append(tok)
+    return out
+
+
+def collect_emd_files(paths) -> list:
+    """拖入路径 → EMD 文件列表（目录递归展开、后缀大小写不敏感、按解析路径去重）。"""
+    found, seen = [], set()
+
+    def _add(p):
+        try:
+            key = str(Path(p).resolve())
+        except OSError:
+            key = str(p)
+        if key not in seen:
+            seen.add(key)
+            found.append(key)
+
+    for p in paths:
+        path = Path(p)
+        try:
+            if path.is_dir():
+                for f in sorted(path.rglob('*')):
+                    if f.suffix.lower() == '.emd' and f.is_file():
+                        _add(f)
+            elif path.suffix.lower() == '.emd' and path.is_file():
+                _add(path)
+        except OSError:
+            continue
+    return found
 
 
 def add_suffix_safe(output_path: Path, suffix: str) -> Path:
@@ -67,7 +124,26 @@ def default_export_options() -> dict:
         'eds': {'export_colormix': True, 'export_elements': True,
                 'export_haadf': True},
         'colormix': {'all_elements': True, 'with_annotation': True},
+        'dcfi': {'last_frame_only': True},
     }
+
+
+def _apply_view_rotation_standalone(analyzer, data, param_key, log=print):
+    """自动恢复 Ceta 相机系数据（TEM/DCFI/Crop/滤波）的 Velox 屏幕显示方向。
+
+    取证（详见 apply_view_rotation docstring）：显示旋转角存于
+    ImageDisplay.angle（**弧度**，即 Velox "Image Rotation" 面板的读数换算）；
+    旋转只作用于显示层，存储数组未旋转。angle=0（2026-02 及更早批次、
+    STEM/EDS 等无 angle 的显示）恒等直通，行为与旧版逐字节一致，无需开关。
+    """
+    from velox_file_analyzer2 import apply_view_rotation
+    angle = float(analyzer.parameters.get(param_key, {}).get('display_angle', 0.0) or 0.0)
+    if abs(angle) < 1e-9:
+        return data
+    out = apply_view_rotation(data, angle_deg=angle)
+    log(f"  视角校正: 显示角 {angle:+.2f}°（自动），"
+        f"{data.shape[0]}x{data.shape[1]} → {out.shape[0]}x{out.shape[1]}")
+    return out
 
 
 def _export_eds_mapping_standalone(analyzer, output_dir, filename_stem, options, log=print):
@@ -206,7 +282,8 @@ def _export_colormix_lineprofile_standalone(analyzer, output_dir, filename_stem,
                 analyzer.line_profile_data, output_path=output_path,
                 pixel_size=analyzer.parameters['pixelsize'],
                 pixel_unit=analyzer.parameters['pixelunit'],
-                line_length_px=analyzer.line_position.get('length') if hasattr(analyzer, 'line_position') else None
+                line_length_px=analyzer.line_position.get('length') if hasattr(analyzer, 'line_position') else None,
+                quantification_mode=analyzer.parameters.get('quantification_mode', '')
             )
             log(f"  ✓ Line Profile 图像: {filename}")
         except Exception as e:
@@ -323,7 +400,8 @@ def export_by_type_standalone(analyzer, output_dir, filename_stem, options, log=
         log("检测到 TEM 图像")
         _export_generic_image_standalone(
             analyzer, output_dir, filename_stem, 'Ceta',
-            analyzer.tem_data, analyzer.tem_metadata, options, log)
+            _apply_view_rotation_standalone(analyzer, analyzer.tem_data, 'Ceta', log),
+            analyzer.tem_metadata, options, log)
     if hasattr(analyzer, 'stem_feature_path'):
         log("检测到 STEM 图像")
         for key in analyzer.stem_data.keys():
@@ -342,16 +420,25 @@ def export_by_type_standalone(analyzer, output_dir, filename_stem, options, log=
         log("检测到 DCFI 图像")
         params = analyzer.parameters.get('DCFI', {})
         image_name = params.get('image_name', f"{filename_stem}-DCFI")
+        data = analyzer.dcfi_data
+        if options.get('dcfi', {}).get('last_frame_only', True) \
+                and getattr(data, 'ndim', 2) == 3 and data.shape[-1] > 1:
+            # dcfi_data 的每一帧都是"截至第 k 帧的累积积分图"，
+            # 最后一帧即全部叠加后的积分图像；原始逐帧数据由 TEM/STEM 分支导出
+            data = data[:, :, -1]
+            log("  DCFI: 仅导出最后一帧（积分图）")
+        data = _apply_view_rotation_standalone(analyzer, data, 'DCFI', log)
         _export_generic_image_standalone(
             analyzer, output_dir, filename_stem, 'DCFI',
-            analyzer.dcfi_data, {}, options, log, custom_name=image_name)
-    if hasattr(analyzer, 'crop_feature_path'):
+            data, {}, options, log, custom_name=image_name)
+    if hasattr(analyzer, 'crop_feature_path') and hasattr(analyzer, 'crop_data'):
         log("检测到裁剪图像")
         params = analyzer.parameters.get('crop', {})
         image_name = params.get('image_name', f"{filename_stem}-Crop")
         _export_generic_image_standalone(
             analyzer, output_dir, filename_stem, 'crop',
-            analyzer.crop_data, analyzer.crop_metadata, options, log,
+            _apply_view_rotation_standalone(analyzer, analyzer.crop_data, 'crop', log),
+            analyzer.crop_metadata, options, log,
             custom_name=image_name)
     if hasattr(analyzer, 'image_filter_feature_path'):
         log("检测到滤波图像")
@@ -359,8 +446,17 @@ def export_by_type_standalone(analyzer, output_dir, filename_stem, options, log=
         image_name = params.get('image_name', f"{filename_stem}-Filtered")
         _export_generic_image_standalone(
             analyzer, output_dir, filename_stem, 'filter',
-            analyzer.filter_data, analyzer.filter_metadata, options, log,
+            _apply_view_rotation_standalone(analyzer, analyzer.filter_data, 'filter', log),
+            analyzer.filter_metadata, options, log,
             custom_name=image_name)
+    # 半成品文件（缺 /Features）：analyzer._recover_partial_images 的抢救结果
+    for item in getattr(analyzer, 'recovered_images', []):
+        log(f"文件未写完，按原始数据恢复导出: {item['image_name']}"
+            f"（{item['data'].shape} @ {item['pixelsize']} {item['pixelunit']}）")
+        _export_generic_image_standalone(
+            analyzer, output_dir, filename_stem, 'recovered',
+            item['data'], {}, options, log,
+            custom_name=item['image_name'], params_override=item)
 
 
 def process_one_file(args):
@@ -425,7 +521,12 @@ class EMDConverterGUI:
             'all_elements': BooleanVar(value=True),
             'with_annotation': BooleanVar(value=True),
         }
-        
+
+        # DCFI 特有选项（默认仅导出最后一帧总积分图，原始 slice 由 TEM/STEM 分支导出）
+        self.dcfi_options = {
+            'last_frame_only': BooleanVar(value=True),
+        }
+
         # 加载保存的配置
         self._load_config()
         
@@ -436,7 +537,12 @@ class EMDConverterGUI:
         
         # 重定向标准输出到日志区域
         self._redirect_stdout()
-        
+
+        # 拖放添加文件/文件夹（依赖 tkinterdnd2，缺失时自动降级为提示）
+        self._dnd_ready = False
+        self._listbox_bg = None
+        self._enable_dnd()
+
         # 窗口关闭时保存配置
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
         
@@ -446,7 +552,7 @@ class EMDConverterGUI:
         # === 文件选择区域 ===
         self.file_frame = Frame(self.root)
         
-        self.file_label = Label(self.file_frame, text="EMD 文件:", font=('Microsoft YaHei', 10))
+        self.file_label = Label(self.file_frame, text="EMD 文件:（也可直接拖放文件或文件夹到窗口）", font=('Microsoft YaHei', 10))
         
         self.file_listbox = Listbox(self.file_frame, selectmode='extended', height=8)
         self.file_scrollbar = Scrollbar(self.file_frame, orient='vertical', command=self.file_listbox.yview)
@@ -489,6 +595,11 @@ class EMDConverterGUI:
         self.colormix_label = Label(self.colormix_frame, text="Color Mix:", font=('Microsoft YaHei', 10, 'bold'))
         self.cb_all_elements = Checkbutton(self.colormix_frame, text="包含所有元素", variable=self.colormix_options['all_elements'])
         self.cb_with_annotation = Checkbutton(self.colormix_frame, text="包含线扫描标注", variable=self.colormix_options['with_annotation'])
+
+        # DCFI 选项
+        self.dcfi_frame = Frame(self.options_frame)
+        self.dcfi_label = Label(self.dcfi_frame, text="DCFI 选项:", font=('Microsoft YaHei', 10, 'bold'))
+        self.cb_dcfi_last_frame = Checkbutton(self.dcfi_frame, text="仅导出最后一帧（积分图）", variable=self.dcfi_options['last_frame_only'])
         
         # === 进度区域 ===
         self.progress_frame = Frame(self.root)
@@ -558,6 +669,11 @@ class EMDConverterGUI:
         self.colormix_label.pack(side='left', padx=5)
         self.cb_all_elements.pack(side='left', padx=10)
         self.cb_with_annotation.pack(side='left', padx=10)
+
+        # DCFI 选项
+        self.dcfi_frame.pack(fill='x', padx=10, pady=2)
+        self.dcfi_label.pack(side='left', padx=5)
+        self.cb_dcfi_last_frame.pack(side='left', padx=10)
         
         # 进度区域
         self.progress_frame.pack(fill='x', padx=10, pady=5)
@@ -633,7 +749,11 @@ class EMDConverterGUI:
                 for key, value in config.get('colormix_options', {}).items():
                     if key in self.colormix_options:
                         self.colormix_options[key].set(value)
-                        
+
+                for key, value in config.get('dcfi_options', {}).items():
+                    if key in self.dcfi_options:
+                        self.dcfi_options[key].set(value)
+
                 # 加载输出目录
                 output_dir = config.get('output_dir', '')
                 if output_dir and Path(output_dir).exists():
@@ -649,6 +769,7 @@ class EMDConverterGUI:
                 'export_options': {k: v.get() for k, v in self.export_options.items()},
                 'eds_options': {k: v.get() for k, v in self.eds_options.items()},
                 'colormix_options': {k: v.get() for k, v in self.colormix_options.items()},
+                'dcfi_options': {k: v.get() for k, v in self.dcfi_options.items()},
                 'output_dir': self.output_dir.get(),
             }
             
@@ -683,7 +804,11 @@ class EMDConverterGUI:
                 for key, value in config.get('colormix_options', {}).items():
                     if key in self.colormix_options:
                         self.colormix_options[key].set(value)
-                        
+
+                for key, value in config.get('dcfi_options', {}).items():
+                    if key in self.dcfi_options:
+                        self.dcfi_options[key].set(value)
+
                 self._log(f"配置已加载: {filename}")
                 messagebox.showinfo("成功", "配置已加载")
                 
@@ -718,6 +843,7 @@ EMD 文件批量转换工具使用说明
 1. 添加文件：
    - 点击"添加文件"选择单个或多个 EMD 文件
    - 或点击"添加文件夹"添加整个文件夹中的 EMD 文件
+   - 也可以直接把 EMD 文件或文件夹拖放到窗口任意位置（需安装 tkinterdnd2）
 
 2. 设置输出目录：
    - 点击"浏览..."选择输出位置
@@ -728,6 +854,11 @@ EMD 文件批量转换工具使用说明
    - TIFF: 16-bit 格式，ImageJ 兼容
    - PNG: 带比例尺的图像，适合论文
    - CSV: 定量数据和谱图数据
+   - DCFI 选项: 默认仅导出最后一帧（漂移校正后全部叠加的积分图像）；
+     取消勾选则导出整个累积积分序列。原始逐帧数据始终由 TEM/STEM 导出
+   - 视角方向: Ceta 系图像（TEM/DCFI/裁剪/滤波）自动恢复 Velox 屏幕显示
+     方向（按 Image Rotation 的显示角度旋转并裁内接方形）；显示角度为 0
+     的文件与 STEM/EDS 等不受影响，无需任何设置
 
 4. 点击"开始转换"按钮开始处理
 
@@ -757,6 +888,55 @@ EMD 文件批量转换工具 v1.0
         """
         messagebox.showinfo("关于", about_text)
         
+    def _enable_dnd(self):
+        """注册拖放目标（tkinterdnd2 可用时）。失败仅提示，不影响其余功能。"""
+        try:
+            from tkinterdnd2 import DND_FILES
+        except Exception:
+            print("提示: 未安装 tkinterdnd2，拖放添加不可用（pip install tkinterdnd2 后可启用）")
+            return
+        try:
+            self._listbox_bg = self.file_listbox.cget('background')
+            registered = []
+            for w in (self.root, self.file_listbox):
+                try:
+                    w.drop_target_register(DND_FILES)
+                    registered.append(w)
+                except Exception:
+                    pass
+            if not registered:
+                raise RuntimeError("tkdnd 目标注册失败")
+            for w in registered:
+                w.dnd_bind('<<Drop>>', self._on_dnd_drop)
+            self.file_listbox.dnd_bind(
+                '<<DropEnter>>', lambda e: self.file_listbox.config(background='#d7f5dd'))
+            self.file_listbox.dnd_bind(
+                '<<DropLeave>>', lambda e: self.file_listbox.config(background=self._listbox_bg))
+            self._dnd_ready = True
+        except Exception as e:
+            print(f"拖放初始化失败（已禁用拖放）: {e}")
+
+    def _on_dnd_drop(self, event):
+        """处理拖放：解析路径 → 展开 EMD → 去重追加到列表。"""
+        try:
+            files = collect_emd_files(parse_drop_paths(event.data))
+        except Exception as e:
+            self._log(f"拖放解析失败: {e}")
+            files = []
+        finally:
+            if self._listbox_bg:
+                self.file_listbox.config(background=self._listbox_bg)
+        if not files:
+            self._log("拖放内容中未找到 EMD 文件")
+            return
+        added = 0
+        for f in files:
+            if f not in self.file_list:
+                self.file_list.append(f)
+                self.file_listbox.insert('end', Path(f).name)
+                added += 1
+        self._log(f"拖放添加: 新增 {added} 个 EMD 文件（拖入路径共含 {len(files)} 个）")
+
     def _add_files(self):
         """添加单个文件"""
         files = filedialog.askopenfilenames(
@@ -1005,6 +1185,9 @@ EMD 文件批量转换工具 v1.0
                 'all_elements': self.colormix_options['all_elements'].get(),
                 'with_annotation': self.colormix_options['with_annotation'].get(),
             },
+            'dcfi': {
+                'last_frame_only': self.dcfi_options['last_frame_only'].get(),
+            },
         }
             
         # 滤波图像
@@ -1013,8 +1196,12 @@ EMD 文件批量转换工具 v1.0
             self._export_filtered(analyzer, output_dir, filename_stem)
             
 def main():
-    """主函数"""
-    root = Tk()
+    """主函数（优先使用支持拖放的 TkinterDnD 根窗口，缺失时回退普通 Tk）"""
+    try:
+        from tkinterdnd2 import TkinterDnD
+        root = TkinterDnD.Tk()
+    except Exception:
+        root = Tk()
     app = EMDConverterGUI(root)
     root.mainloop()
 
