@@ -459,10 +459,13 @@ def export_by_type_standalone(analyzer, output_dir, filename_stem, options, log=
             custom_name=item['image_name'], params_override=item)
 
 
-def process_one_file(args):
-    """子进程/线程 worker：解析并导出单个 EMD 文件。
+def process_one_file_logged(args):
+    """worker（带日志捕获版）：解析并导出单个 EMD 文件。
 
-    args = (file_path, output_base, options)。返回 (stem, error_or_None)。
+    args = (file_path, output_base, options)。
+    返回 (stem, error_or_None, worker_stdout)——worker 进程内的全部 print
+    （分析 INFO、视角校正、✓/✗ 产物清单等）被捕获为字符串随结果回传，
+    供 GUI 并行模式逐文件透传到界面，与串行模式可见性一致。
     """
     # 编码安全：spawn 子进程的 stdout 继承控制台编码（中文 Windows 为 cp936/GBK），
     # 导出日志中的 ✓/✗（U+2713/U+2717）GBK 无法编码，print 会抛
@@ -475,24 +478,37 @@ def process_one_file(args):
                 _s.reconfigure(encoding='utf-8', errors='replace')
     except Exception:
         pass
+    import contextlib
+    import io as _io
     file_path, output_base, options = args
     stem = Path(file_path).stem
+    buf = _io.StringIO()
     try:
-        analyzer = VeloxFileAnalyzer(file_path)
-        try:
-            file_output_dir = Path(output_base) / stem
-            file_output_dir.mkdir(parents=True, exist_ok=True)
-            export_by_type_standalone(analyzer, file_output_dir, stem, options, log=print)
-        finally:
+        with contextlib.redirect_stdout(buf):
+            analyzer = VeloxFileAnalyzer(file_path)
             try:
-                analyzer.f.close()
-            except Exception:
-                pass
-        return (stem, None)
+                file_output_dir = Path(output_base) / stem
+                file_output_dir.mkdir(parents=True, exist_ok=True)
+                export_by_type_standalone(analyzer, file_output_dir, stem, options, log=print)
+            finally:
+                try:
+                    analyzer.f.close()
+                except Exception:
+                    pass
+        return (stem, None, buf.getvalue())
     except MemoryError:
-        return (stem, "内存不足，建议仅导出 DM5 并关闭其他程序")
+        return (stem, "内存不足，建议仅导出 DM5 并关闭其他程序", buf.getvalue())
     except Exception as e:
-        return (stem, f"{type(e).__name__}: {e}")
+        return (stem, f"{type(e).__name__}: {e}", buf.getvalue())
+
+
+def process_one_file(args):
+    """子进程/线程 worker：解析并导出单个 EMD 文件。
+
+    args = (file_path, output_base, options)。返回 (stem, error_or_None)。
+    """
+    stem, err, _worker_log = process_one_file_logged(args)
+    return (stem, err)
 
 
 class EMDConverterGUI:
@@ -1153,7 +1169,8 @@ EMD 文件批量转换工具 v1.0
         
         try:
             with ProcessPoolExecutor(max_workers=workers) as pool:
-                futures = {pool.submit(process_one_file, t): i for i, t in enumerate(tasks)}
+                futures = {pool.submit(process_one_file_logged, t): i
+                           for i, t in enumerate(tasks)}
                 for fut in as_completed(futures):
                     if not self.is_processing:
                         # 停止：取消尚未开始的未来任务（进行中的无法中断）
@@ -1164,11 +1181,17 @@ EMD 文件批量转换工具 v1.0
                     idx = futures[fut]
                     self.root.after(0, lambda i=idx + 1: self._update_progress(i, total, f"正在处理: {Path(files[idx]).name}"))
                     try:
-                        stem, err = fut.result()
+                        stem, err, worker_log = fut.result()
                     except Exception as e:
-                        stem, err = Path(files[idx]).stem, f"worker 异常: {e}"
+                        stem, err, worker_log = Path(files[idx]).stem, f"worker 异常: {e}", ''
+                    # 逐文件透传 worker 日志：并行模式与串行模式可见性一致
+                    header = f"✗ ({done_count}/{total}) {stem}: {err}" if err \
+                        else f"✓ ({done_count}/{total}) {stem}"
+                    if worker_log and worker_log.strip():
+                        self._log(header + "\n" + worker_log.rstrip())
+                    else:
+                        self._log(header)
                     if err:
-                        self._log(f"错误: {stem}: {err}")
                         failed.append((stem, err))
                     else:
                         success_count += 1

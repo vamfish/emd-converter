@@ -161,6 +161,14 @@ def test_process_files_parallel_end_to_end(tmp_path):
         assert 'done' in state, "_conversion_finished 未被调度"
         assert state['done'][0] == 3, f"成功数异常: {state['done']}"
         assert len(list(out.rglob('*.dm5'))) >= 3
+        # 冲刷 after 队列，再校验逐文件透传日志确实在界面文本框中
+        import time as _time
+        for _ in range(20):
+            root.update()
+            _time.sleep(0.03)
+        logtxt = app.log_text.get('1.0', 'end')
+        assert logtxt.count('✓ (') == 3, "并行逐文件日志缺失"
+        assert '(3/3)' in logtxt
     finally:
         sys.stdout = old_stdout
         root.destroy()
