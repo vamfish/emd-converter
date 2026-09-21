@@ -714,21 +714,68 @@ class EMDConverterGUI:
         help_menu.add_command(label="关于", command=self._show_about)
         
     def _redirect_stdout(self):
-        """重定向标准输出到日志区域"""
+        """重定向标准输出到日志区域（线程安全：队列 + 主线程轮询冲刷）。
+
+        转换线程（_process_files / _process_files_parallel）中的 print 若
+        直接操作 tkinter Text 组件，属于跨线程调用 Tcl，高频时会随机死锁
+        （表现为 GUI 假死/并行"卡住"）。所有线程只向 queue 投递，由主线程
+        定时器统一冲刷进组件；主线程调用退化为直接写，保持即时顺序。
+        """
+        import threading as _threading
+        from queue import Queue
+
+        self._log_queue = Queue()
+
         class StdoutRedirector:
-            def __init__(self, text_widget):
+            def __init__(self, text_widget, root, q):
                 self.text_widget = text_widget
-                
-            def write(self, text):
+                self.root = root
+                self.q = q
+                self._real_stdout = (sys.__stdout__ if sys.__stdout__ is not None
+                                     else sys.stderr)
+
+            def _append(self, text):
                 self.text_widget.config(state='normal')
                 self.text_widget.insert('end', text)
                 self.text_widget.see('end')
                 self.text_widget.config(state='disabled')
-                
+
+            def write(self, text):
+                if not text:
+                    return 0
+                try:
+                    if _threading.current_thread() is _threading.main_thread():
+                        self._append(text)
+                    else:
+                        self.q.put(text)
+                except Exception:
+                    try:
+                        self._real_stdout.write(text)
+                    except Exception:
+                        pass
+                return len(text)
+
             def flush(self):
                 pass
-                
-        sys.stdout = StdoutRedirector(self.log_text)
+
+        sys.stdout = StdoutRedirector(self.log_text, self.root, self._log_queue)
+
+        def _drain():
+            # 主线程定时器：批量取出队列文本写入组件；组件销毁后自动停止
+            try:
+                batch = []
+                while True:
+                    try:
+                        batch.append(self._log_queue.get_nowait())
+                    except Exception:
+                        break
+                if batch:
+                    sys.stdout._append(''.join(batch))
+                self.root.after(80, _drain)
+            except Exception:
+                pass
+
+        self.root.after(80, _drain)
         
     def _load_config(self):
         """加载配置文件"""
@@ -1207,4 +1254,9 @@ def main():
 
 
 if __name__ == "__main__":
+    # PyInstaller/冻结 exe + Windows 多进程必需：spawn 的子进程会重新执行
+    # 本 exe，freeze_support() 识别引导参数后直接进入 worker 流程；
+    # 缺失时子进程会再次运行 main()（弹独立 GUI、永不回池），并行处理死锁。
+    import multiprocessing
+    multiprocessing.freeze_support()
     main()
