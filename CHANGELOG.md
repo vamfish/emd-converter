@@ -7,6 +7,27 @@
 格式约定（Keep a Changelog 风格）：
 `### 性能 / 内存 / 可靠性 / 修复 / 工程化` 分类列表。
 
+## [v0.3.2] - 2026-09-21
+
+### 修复
+- **GUI 并行处理卡死的真正根因（v0.2.0 起即存在）**：
+  `_compute_parallel_workers` 对 `file_list` 元素（str 路径）调用 `p.stat()`
+  直接抛 AttributeError；该代码运行于 `_process_files` 的守护线程内，
+  异常被线程静默吞掉（windowed exe 无控制台）→ 日志永远停在
+  "并行处理开启，任务数: N"，UI 假死。v0.3.1 的 freeze_support 修复是
+  冻结环境 spawn 正常工作的必要条件，但崩溃发生在其之前，故问题依旧。
+  现改用 `os.stat()`（兼容 str/Path，文件缺失容错）
+- 测试防线补强：`test_compute_parallel_workers` 改用**真实文件 + str 路径**
+  （旧 SimpleNamespace mock 恰好掩盖了 str/Path 类型错配）；新增
+  `test_process_files_parallel_end_to_end`——真实 mainloop + 转换线程 +
+  3 文件进程池全链路，任何环节静默死亡都会超时暴露
+- **并行子进程 GBK 控制台崩溃**：spawn 子进程的 stdout 继承中文 Windows
+  控制台编码 cp936/GBK，导出日志中的 ✓/✗ 字符无法编码，`print` 抛
+  UnicodeEncodeError 导致每个任务都以"失败"收场（成功 0/失败 N）。
+  worker 入口现将子进程 stdout/stderr 统一 reconfigure 为 UTF-8+replace
+  （无 reconfigure 能力的流不受影响，保护 GUI 的 Tk 日志重定向）；
+  新增 `test_process_one_file_survives_gbk_console` 回归
+
 ## [v0.3.1] - 2026-09-21
 
 ### 修复

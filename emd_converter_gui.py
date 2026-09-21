@@ -461,9 +461,20 @@ def export_by_type_standalone(analyzer, output_dir, filename_stem, options, log=
 
 def process_one_file(args):
     """子进程/线程 worker：解析并导出单个 EMD 文件。
-    
+
     args = (file_path, output_base, options)。返回 (stem, error_or_None)。
     """
+    # 编码安全：spawn 子进程的 stdout 继承控制台编码（中文 Windows 为 cp936/GBK），
+    # 导出日志中的 ✓/✗（U+2713/U+2717）GBK 无法编码，print 会抛
+    # UnicodeEncodeError 把整个任务拖成失败。worker 内统一切到
+    # UTF-8 + errors='replace'（流不支持 reconfigure 时保持原样，
+    # 避免覆盖 GUI 主线程的 Tk 日志重定向）。
+    try:
+        for _s in (sys.stdout, sys.stderr):
+            if hasattr(_s, 'reconfigure'):
+                _s.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
     file_path, output_base, options = args
     stem = Path(file_path).stem
     try:
@@ -1171,13 +1182,23 @@ EMD 文件批量转换工具 v1.0
     def _compute_parallel_workers(files) -> int:
         """按可用内存 ÷ 单文件预估峰值计算 worker 数（上限 8）；
         大文件自动独占（worker=1），避免多 worker 内存叠加。
+
+        注意：GUI 的 file_list 元素是 str（非 Path），这里必须用 os.stat
+        兼容 str/Path——v0.3.1 及以前对 str 调 p.stat() 抛 AttributeError，
+        且 _process_files_parallel 运行在守护线程里、异常被静默吞掉，
+        表现为并行处理永远停在"并行处理开启，任务数: N"。
         """
         try:
             import psutil
             avail = psutil.virtual_memory().available
         except ImportError:
             avail = 8 * 2**30  # 保守假设 8GB 可用
-        sizes = [max(p.stat().st_size, 1) for p in files]
+        sizes = []
+        for p in files:
+            try:
+                sizes.append(max(os.stat(str(p)).st_size, 1))
+            except OSError:
+                sizes.append(1)  # 文件不存在/无权限不影响 worker 决策
         biggest = max(sizes)
         per_worker = max(biggest * 2.2, 512 * 2**20)  # 每个 worker 峰值 ≈ 最大文件 ×2.2
         n = max(1, int(avail // per_worker))
